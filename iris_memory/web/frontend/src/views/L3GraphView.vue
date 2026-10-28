@@ -62,6 +62,7 @@
             :depth="memoryStore.l3Depth"
             :max-nodes="memoryStore.l3MaxNodes"
             :layout="memoryStore.l3Layout"
+            :view-mode="memoryStore.l3ViewMode"
             :min-confidence="memoryStore.l3Filters.minConfidence"
             :available-node-types="memoryStore.l3AvailableNodeTypes"
             :available-relation-types="memoryStore.l3AvailableRelationTypes"
@@ -77,12 +78,14 @@
             @update:depth="handleDepthChange"
             @update:max-nodes="handleMaxNodesChange"
             @update:layout="handleLayoutChange"
+            @update:view-mode="handleViewModeChange"
             @update:min-confidence="handleMinConfidenceChange"
             @update:group-id="handleGroupChange"
             @toggle-node-type="memoryStore.toggleNodeTypeFilter"
             @toggle-relation-type="memoryStore.toggleRelationTypeFilter"
             @reset-filters="memoryStore.resetFilters"
             @random-node="handleRandomMainNode"
+            @refresh-all="handleRefreshAllGraph"
             @focus-node="handleFocusNode"
           />
         </div>
@@ -96,6 +99,7 @@
             :loading="memoryStore.l3Loading"
             :start-node="memoryStore.l3StartNode"
             :layout="memoryStore.l3Layout"
+            :view-mode="memoryStore.l3ViewMode"
             :can-go-back="memoryStore.canGoBack"
             :can-go-forward="memoryStore.canGoForward"
             @node-click="handleNodeClick"
@@ -231,12 +235,29 @@ const showSnackbar = (text: string, color: 'success' | 'error' | 'info' = 'succe
 }
 
 // ---- 图谱加载 ----
-const loadGraph = () => memoryStore.fetchL3Graph()
+const loadGraph = () => {
+  if (memoryStore.l3ViewMode === 'all') {
+    memoryStore.fetchL3AllGraph()
+  } else {
+    memoryStore.fetchL3Graph()
+  }
+}
 
-// 随机主节点：显式重新让后端随机挑选一个起始节点
+// 随机主节点：显式重新让后端随机挑选一个起始节点（仅聚焦模式有意义）
 const handleRandomMainNode = () => memoryStore.fetchL3Graph()
 
+// 全图模式刷新
+const handleRefreshAllGraph = () => memoryStore.fetchL3AllGraph()
+
+// 视图模式切换
+const handleViewModeChange = (mode: 'focus' | 'all') => memoryStore.setViewMode(mode)
+
 const handleExpandNode = (nodeId: string) => {
+  // 全图模式下双击不重新扩展（已展示全库），改为聚焦该节点
+  if (memoryStore.l3ViewMode === 'all') {
+    canvasRef.value?.focusNode(nodeId)
+    return
+  }
   memoryStore.expandFromNode(nodeId)
 }
 

@@ -777,6 +777,34 @@ class HiddenConfig:
             "group": "主动回复·触发门控",
         },
     )
+    reply_ignore_sender_ids: str = field(
+        default="",
+        metadata={
+            "description": "主动回复忽略的发送者ID，逗号或换行分隔。"
+            "这些账号的普通发言不会进入滑动窗口、不参与插话/跟进采样、"
+            "不会建立关注锚点；@ 唤醒的被动回复不受影响",
+            "group": "主动回复·触发门控",
+        },
+    )
+    reply_ignore_sync_external: bool = field(
+        default=True,
+        metadata={
+            "description": "自动同步 astrbot_plugin_completely_disable 的黑名单到主动回复忽略名单"
+            "（仅该插件处于 blacklist 模式时生效）",
+            "group": "主动回复·触发门控",
+        },
+    )
+    reply_ignore_sync_user_only: bool = field(
+        default=True,
+        metadata={
+            "description": "只同步黑名单里明确标注为用户的条目"
+            "（如 @昵称(ID)、qq:FriendMessage:ID），跳过裸数字。"
+            "该黑名单插件在群聊里只比对群号、从不比对发送者，它的名单是"
+            "「群号+好友号」混合体；若把裸数字也当发送者导入，会把同号的真人误忽略。"
+            "关闭后回到旧行为（整表导入）",
+            "group": "主动回复·触发门控",
+        },
+    )
     reply_passive_watch_min_interval: int = field(
         default=600,
         metadata={

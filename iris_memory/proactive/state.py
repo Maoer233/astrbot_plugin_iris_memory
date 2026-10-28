@@ -89,6 +89,8 @@ class GroupStateData:
     initiate_no_reply_streak: int = 0
     initiate_timestamps: list[float] = field(default_factory=list)  # 滚动 24h 发起记录
     last_human_message_at: float = 0.0
+    # @ 唤醒后的活跃窗口截止时刻：窗口内跳过采样阈值，逐条消息评估是否接话
+    wake_window_until: float = 0.0
     initiate_next_check_at: float = 0.0  # 每群独立的下一次候选时刻
     initiate_hazard_at: float = 0.0  # 上次风险率结算时刻
     initiate_hazard_probability: float = 0.0  # 最近一次候选概率，仅用于观测
@@ -622,6 +624,12 @@ class StateManager:
 
     def record_skip_reply(self, group_id: str) -> None:
         data = self._ensure_group(group_id)
+        # 活跃窗口内的高频评估不计退避：这一轮不接话不代表群冷，
+        # 否则窗口结束门槛会被抬到最高 5 级，反而更难开口。
+        if self.in_wake_window(group_id):
+            data.consecutive_replies = 0
+            self._mark_dirty(group_id, data)
+            return
         if data.backoff_level < MAX_BACKOFF_LEVEL:
             data.backoff_level += 1
         if data.last_backoff_time <= 0:
@@ -631,6 +639,13 @@ class StateManager:
 
     def record_actual_reply(self, group_id: str, *, count_consecutive: bool = True) -> None:
         data = self._ensure_group(group_id)
+        # 活跃窗口内是「围绕我的这一轮对话」，连着接几句属正常，
+        # 不计入连续回复疲劳，窗口结束从干净状态重新开始。
+        if self.in_wake_window(group_id):
+            data.consecutive_replies = 0
+            data.backoff_level = max(0, data.backoff_level - 1)
+            self._mark_dirty(group_id, data)
+            return
         if data.consecutive_replies == 0:
             data.backoff_level = max(0, data.backoff_level - 1)
         if count_consecutive:
@@ -651,12 +666,37 @@ class StateManager:
 
         self._mark_dirty(group_id, data)
 
+    # ---- @ 唤醒活跃窗口 ----
+
+    def open_wake_window(self, group_id: str, seconds: float) -> None:
+        """@ 唤醒后开启短暂活跃窗口。
+
+        窗口内的群消息不再累计到采样阈值，而是逐条评估是否接话；
+        窗口一到自动失效，回归常规采样。
+        """
+        data = self._ensure_group(group_id)
+        data.wake_window_until = time.time() + max(0.0, seconds)
+        self._mark_dirty(group_id, data)
+
+    def in_wake_window(self, group_id: str) -> bool:
+        data = self._ensure_group(group_id)
+        if data.wake_window_until <= 0:
+            return False
+        if time.time() >= data.wake_window_until:
+            data.wake_window_until = 0.0
+            self._mark_dirty(group_id, data)
+            return False
+        return True
+
     def can_detect(self, group_id: str, *, follow_up: bool = False) -> bool:
         data = self._ensure_group(group_id)
         now = time.time()
         min_interval = float(self._config.trigger_min_interval)
         if follow_up:
             min_interval *= 0.5
+        # 活跃窗口内话题围绕 bot 展开，几乎不设间隔，跟上对话节奏
+        if self.in_wake_window(group_id):
+            min_interval = min(min_interval, 2.0)
         return (now - data.last_detect_time) >= min_interval
 
     def record_detect_time(self, group_id: str) -> None:
@@ -684,6 +724,7 @@ class StateManager:
         data.initiate_no_reply_streak = 0
         data.initiate_timestamps.clear()
         data.last_human_message_at = 0.0
+        data.wake_window_until = 0.0
         data.initiate_next_check_at = 0.0
         data.initiate_hazard_at = 0.0
         data.initiate_hazard_probability = 0.0

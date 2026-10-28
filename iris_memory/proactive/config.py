@@ -24,6 +24,9 @@ _DEFAULTS = {
     "quality_threshold": 0.2,
     "provider_id": "",
     "trigger_min_interval": 30,
+    "ignore_sender_ids": "",
+    "ignore_sync_external": True,
+    "ignore_sync_user_only": True,
     "passive_watch_min_interval": 600,
     "passive_watch_enabled": False,
     "boost_factor": 0.6,
@@ -57,6 +60,9 @@ _HIDDEN_KEY_MAP = {
     "follow_up_aggregate_window": "reply_follow_up_aggregate_window",
     "quality_threshold": "reply_quality_threshold",
     "trigger_min_interval": "reply_trigger_min_interval",
+    "ignore_sender_ids": "reply_ignore_sender_ids",
+    "ignore_sync_external": "reply_ignore_sync_external",
+    "ignore_sync_user_only": "reply_ignore_sync_user_only",
     "passive_watch_min_interval": "reply_passive_watch_min_interval",
     "passive_watch_enabled": "reply_passive_watch_enabled",
     "boost_factor": "reply_boost_factor",
@@ -251,6 +257,26 @@ class ConfigManager:
     @property
     def trigger_min_interval(self) -> int:
         return max(10, min(120, int(self._get("trigger_min_interval"))))
+
+    @property
+    def ignore_sender_ids(self) -> str:
+        """主动回复忽略的发送者 ID 原文（逗号/换行分隔，解析在 SenderIgnoreList）。"""
+        return str(self._get("ignore_sender_ids") or "")
+
+    @property
+    def ignore_sync_external(self) -> bool:
+        v = self._get("ignore_sync_external")
+        if isinstance(v, bool):
+            return v
+        return str(v).strip().lower() in ("true", "1", "yes", "on")
+
+    @property
+    def ignore_sync_user_only(self) -> bool:
+        """严格同步：跳过可能是群号的纯数字条目。"""
+        v = self._get("ignore_sync_user_only")
+        if isinstance(v, bool):
+            return v
+        return str(v).strip().lower() in ("true", "1", "yes", "on")
 
     @property
     def passive_watch_min_interval(self) -> int:

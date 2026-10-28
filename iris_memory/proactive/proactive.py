@@ -73,6 +73,8 @@ class ProactiveEngine:
         save_fn: Callable[[], Awaitable[None]],
         on_initiate_sent: Callable[[str, str], Awaitable[None]] | None = None,
         text_transform: Callable[[str], str] | None = None,
+        watch_filter: Callable[[list[str]], list[str]] | None = None,
+        ignore_senders_get: Callable[[], set[str]] | None = None,
     ) -> None:
         self._context = context
         self._config = config
@@ -89,6 +91,8 @@ class ProactiveEngine:
         self._save_fn = save_fn
         self._on_initiate_sent = on_initiate_sent
         self._text_transform = text_transform
+        self._watch_filter = watch_filter
+        self._ignore_senders_get = ignore_senders_get
         self._task: asyncio.Task | None = None
         self._wake_event = asyncio.Event()
         self._initiating: set[str] = set()
@@ -96,6 +100,37 @@ class ProactiveEngine:
 
     def is_initiating(self, group_id: str) -> bool:
         return group_id in self._initiating
+
+    def _filter_watch(self, users: list[str] | None) -> list[str]:
+        """过滤决策给出的关注用户（剔除主动回复忽略名单中的账号）。"""
+        if not users or self._watch_filter is None:
+            return list(users or [])
+        try:
+            return list(self._watch_filter(list(users)))
+        except Exception as e:
+            logger.debug("Iris Reply: watch filter failed for initiate: %s", e)
+            return list(users)
+
+    def _ignore_set(self) -> set[str]:
+        """当前生效的忽略发送者集合（供 prompt 打码）。"""
+        if self._ignore_senders_get is None:
+            return set()
+        try:
+            return set(self._ignore_senders_get() or set())
+        except Exception as e:
+            logger.debug("Iris Reply: ignore list resolve failed: %s", e)
+            return set()
+
+    def _has_substantive(self, messages: list[WindowMessage]) -> bool:
+        """窗口里是否存在「非忽略账号」的发言。
+
+        用于主动发起的准入判断：只有被忽略账号的发言时，打码后的上下文
+        没有任何可依据的内容，不应据此开启新话题。
+        """
+        ignore = self._ignore_set()
+        if not ignore:
+            return bool(messages)
+        return any(str(m.sender_id) not in ignore for m in messages)
 
     async def start(self) -> None:
         if not self._config.proactive_enabled:
@@ -181,22 +216,42 @@ class ProactiveEngine:
                 self._schedule_group(group_id, now=now)
 
     def _next_deadline(self) -> float:
+        """最近一个"值得评估"的候选时间。
+
+        必须与 ``_scan_due`` 用同一套准入判据（``_has_substantive``）：
+        若这里算了某群、而 ``_scan_due`` 又跳过它，该群的
+        ``next_initiate_check`` 会一直停在过去，``_loop`` 的 timeout
+        退化成 0.05 秒并无限空转。
+        """
         deadlines = [
             self._state.get_next_initiate_check(gid)
             for gid in self._state.get_whitelist()
-            if self._window.get_messages(gid)
+            if self._has_substantive(self._window.get_messages(gid) or [])
             and self._state.get_next_initiate_check(gid) > 0
         ]
         return min(deadlines) if deadlines else 0.0
 
     async def _scan_due(self) -> None:
         now = time.time()
-        due = [
-            gid
-            for gid in self._state.get_whitelist()
-            if self._window.get_messages(gid)
-            and 0 < self._state.get_next_initiate_check(gid) <= now
-        ]
+        due = []
+        for gid in self._state.get_whitelist():
+            messages = self._window.get_messages(gid)
+            if not messages:
+                # 窗口为空：不进入决策，也不重排期。
+                # 原实现根本不处理这种群；若在这里重排期，每个还没说过话的
+                # 群都会每 60 秒抖一次随机改期并置 dirty，白耗写盘。
+                # 等真有消息进来时 _ensure_schedules 会重新排期。
+                continue
+            if not self._has_substantive(messages):
+                # 只剩被忽略账号的发言：不值得进入决策。
+                # 只在候选时间**已到期**时重排期，避免每轮都改期并置 dirty。
+                # 若 next_check 还在未来，交给 _loop 正常等待即可。
+                pending = self._state.get_next_initiate_check(gid)
+                if 0 < pending <= now:
+                    self._schedule_group(gid, now=now)
+                continue
+            if 0 < self._state.get_next_initiate_check(gid) <= now:
+                due.append(gid)
         random.shuffle(due)
         for group_id in due:
             await self._check_pending_timeout(group_id)
@@ -256,6 +311,12 @@ class ProactiveEngine:
             return "无法获取 LLM 提供商"
 
         messages = self._window.get_messages(group_id)
+        # 窗口里若只剩被忽略账号的发言（例如那个人 @ 过 bot 把消息带进了
+        # 窗口，随后其他人一直没说话），打码后的上下文是一行空占位，
+        # 模型没有任何依据却仍可能发起话题。显式拒绝这种情形。
+        # 重排期由 _scan_due 的统一出口负责，这里不重复排，避免双重改期。
+        if messages and not self._has_substantive(messages):
+            return "窗口内没有非忽略账号的发言，跳过发起"
         quiet_minutes = int((time.time() - messages[-1].timestamp) / 60) if messages else 0
         context_cutoff = max(
             [m.timestamp for m in messages]
@@ -393,7 +454,7 @@ class ProactiveEngine:
                     group_id,
                     topic=decision.topic or decision.observation,
                     bot_message=text,
-                    users=decision.watch or None,
+                    users=self._filter_watch(decision.watch) or None,
                     keywords=decision.watch_keywords or None,
                     reason=decision.why_now or decision.why,
                 )
@@ -473,7 +534,9 @@ class ProactiveEngine:
             )
 
         messages = self._window.get_messages(group_id)
-        context_block = self._packager.package(group_id, messages, "initiate")
+        context_block = self._packager.package(
+            group_id, messages, "initiate", ignore_senders=self._ignore_set(),
+        )
         topic = decision.topic.strip() or "自由选择一个轻松、大家能接上话的角度"
         hint = SPEAK_HINTS["initiate"].format(
             topic=topic,

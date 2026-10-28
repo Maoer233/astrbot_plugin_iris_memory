@@ -64,7 +64,13 @@ export const RELATION_TYPE_LABELS: Record<string, string> = {
   HAS_TRAIT: '具有',
   HAS_GOAL: '追求',
   HAS_BELIEF: '相信',
+  // 以下为提取器 LLM 输出漂移产生的同义类型，统一映射为中文
+  BELIEVES: '相信',
+  HOLDS_BELIEF: '相信',
   PARTICIPATED_IN: '参与',
+  INVOLVED_IN: '参与',
+  EXPERIENCED_EVENT: '经历',
+  EXPERIENCED: '经历',
   LOCATED_AT: '位于',
   HAPPENED_AT: '发生在',
   PART_OF: '属于',
@@ -72,6 +78,8 @@ export const RELATION_TYPE_LABELS: Record<string, string> = {
   CONTRADICTS: '矛盾',
   SUPPORTS: '支持',
   RELATED_TO: '相关',
+  MENTIONED: '提及',
+  DISCUSSED: '讨论过',
 }
 
 export const getNodeIcon = (label: string): string => NODE_TYPE_ICONS[label] || 'mdi-tag'

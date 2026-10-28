@@ -71,6 +71,8 @@ class Config:
     _defaults: Defaults
     _lock: threading.RLock
     _data_dir: Path
+    _ignore_snapshot_provider: Optional[Callable[[], set[str]]]
+    _ignore_external_provider: Optional[Callable[[], set[str]]]
 
     def __init__(
         self,
@@ -92,6 +94,8 @@ class Config:
         self._defaults = defaults
         self._lock = threading.RLock()
         self._data_dir = data_dir
+        self._ignore_snapshot_provider = None
+        self._ignore_external_provider = None
 
     @property
     def data_dir(self) -> Path:
@@ -321,6 +325,49 @@ class Config:
         """重置隐藏配置为默认值"""
         self._hidden.reset_to_defaults()
         logger.info("已重置隐藏配置为默认值")
+
+    # ------------------------------------------------------------------
+    # 主动回复忽略名单（Web API 只读快照）
+    # ------------------------------------------------------------------
+    def set_ignore_snapshot_provider(self, provider: Callable[[], set[str]]) -> None:
+        """注入「当前生效忽略集合」的取值函数。
+
+        Web API 拿不到插件实例，因此由 main.py 在构造期注入。
+        这样 Web 路由与运行时门控共享同一份数据，不会出现
+        「页面显示已忽略、实际没生效」的错位。
+        """
+        self._ignore_snapshot_provider = provider
+
+    def get_ignore_senders_snapshot(self) -> set[str]:
+        """当前生效的忽略发送者集合（未注入时退回解析手写名单）。"""
+        provider = getattr(self, "_ignore_snapshot_provider", None)
+        if provider is not None:
+            try:
+                return set(provider() or set())
+            except Exception as e:
+                logger.debug(f"忽略名单快照取值失败，回退解析：{e}")
+        from ..proactive.sender_gate import extract_ids
+
+        return extract_ids(self.get("reply_ignore_sender_ids") or "")
+
+    def set_ignore_external_provider(self, provider: Callable[[], set[str]]) -> None:
+        """注入「从外部黑名单同步来的 ID 集合」取值函数。
+
+        用于在 Web 页面把同步条目也列出来。若只渲染手写名单，
+        用户会看到「0 条 / 生效 2 个」的矛盾，无法判断到底拦了谁。
+        """
+        self._ignore_external_provider = provider
+
+    def get_ignore_external_ids(self) -> set[str]:
+        """从外部黑名单同步来的 ID（未注入时为空集）。"""
+        provider = getattr(self, "_ignore_external_provider", None)
+        if provider is None:
+            return set()
+        try:
+            return set(provider() or set())
+        except Exception as e:
+            logger.debug(f"外部同步集合取值失败：{e}")
+            return set()
 
 
 # ============================================================================

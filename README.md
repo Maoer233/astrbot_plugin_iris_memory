@@ -4,6 +4,14 @@
 [![AstrBot Plugin](https://img.shields.io/badge/AstrBot-Plugin-6f42c1)](https://github.com/AstrBotDevs/AstrBot)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](#许可证)
 
+> **本项目是 [leafliber/astrbot_plugin_iris_memory](https://github.com/leafliber/astrbot_plugin_iris_memory) 的衍生版本（fork），原作者 Leafiber。**
+> 遵循 AGPL-3.0 许可证，保留原作者署名，修改内容同样以 AGPL-3.0 开源。
+>
+> 本版新增的主要功能：
+> - **主动回复发送者忽略门控**：可指定账号（如其他 bot）不触发插话、跟进、主动发起；
+>   支持从 `astrbot_plugin_completely_disable` 的黑名单自动同步。
+> - **忽略名单管理页**：Dashboard 内新增「忽略名单」子页面，一人一行、支持批量导入。
+
 Iris Memory 用一个插件完成三件彼此关联的事：让机器人长期记住用户和群聊、在合适的时机自然参与对话，并从真实交流中安全地迭代指定 Persona。所有核心数据默认落在本地，昂贵模型调用前都有本地门控、增量判断或批处理。
 
 ## 核心能力

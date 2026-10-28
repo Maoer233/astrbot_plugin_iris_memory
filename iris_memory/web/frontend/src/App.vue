@@ -108,6 +108,7 @@ const navItems = [
   { to: '/persona-evolution', title: '人格自迭代', icon: 'mdi-account-cog' },
   { to: '/data-manage', title: '数据管理', icon: 'mdi-swap-vertical' },
   { to: '/reply-control', title: '主动回复', icon: 'mdi-robot' },
+  { to: '/ignore-list', title: '忽略名单', icon: 'mdi-account-cancel-outline' },
   { to: '/run-log', title: '运行日志', icon: 'mdi-text-box-search-outline' },
   { to: '/hidden-config', title: '隐藏参数', icon: 'mdi-cog-outline' }
 ]

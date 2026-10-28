@@ -27,7 +27,9 @@ export const useMemoryStore = defineStore('memory', () => {
   const l3StartNode = ref<KGNode | null>(null)
   const l3Loading = ref(false)
   const l3Depth = ref(2)
-  const l3MaxNodes = ref(30)
+  const l3MaxNodes = ref(80)
+  // 视图模式：focus=单起点聚焦扩展（原有行为），all=全库图谱
+  const l3ViewMode = ref<'focus' | 'all'>('focus')
   const l3Layout = ref<L3LayoutType>('force')
   const l3Stats = ref<L3Stats>({
     available: false,
@@ -179,11 +181,60 @@ export const useMemoryStore = defineStore('memory', () => {
   const fetchL3Graph = async (nodeId?: string) => _loadGraph(nodeId, true)
 
   /**
+   * 加载全库图谱（视图模式 all）。
+   * 复用 /l3/nodes 与 /l3/edges 现成路由（后端 limit 上限 500/1000），
+   * 边结构 { source: {id,...}, target: {id,...} } 需扁平化为画布消费的
+   * { source: id, target: id }。不写导航历史（无主节点概念）。
+   */
+  const fetchL3AllGraph = async () => {
+    l3Loading.value = true
+    try {
+      const [nodes, rawEdges] = await Promise.all([
+        memoryApi.getL3Nodes(500, undefined, l3Filters.value.groupId || undefined),
+        memoryApi.getL3Edges(1000, undefined, l3Filters.value.groupId || undefined),
+      ])
+      const nodeIds = new Set(nodes.map((n: any) => n.id))
+      const edges = rawEdges
+        .filter((e: any) => nodeIds.has(e.source?.id) && nodeIds.has(e.target?.id))
+        .map((e: any) => ({
+          source: e.source.id,
+          target: e.target.id,
+          relation: e.relation,
+          weight: e.weight ?? 1,
+          confidence: e.confidence ?? 1,
+        }))
+      l3Graph.value = { nodes, edges, start_node: null }
+      l3StartNode.value = null
+    } catch (error) {
+      console.error('获取L3全图失败:', error)
+      l3Graph.value = { nodes: [], edges: [], start_node: null }
+      l3StartNode.value = null
+    } finally {
+      l3Loading.value = false
+    }
+  }
+
+  /** 切换视图模式并按需加载对应数据 */
+  const setViewMode = async (mode: 'focus' | 'all') => {
+    if (l3ViewMode.value === mode) return
+    l3ViewMode.value = mode
+    if (mode === 'all') {
+      await fetchL3AllGraph()
+    } else {
+      await _loadGraph(l3StartNode.value?.id, false)
+    }
+  }
+
+  /**
    * 刷新当前图谱：保留当前主节点重新加载（若无可用的主节点则后端随机选）。
    * 用于深度/最大节点数等控制参数变更后重新拉取，避免主节点被随机重置。
    * 不写入导航历史，因为这只是参数刷新而非节点跳转。
    */
   const refreshL3Graph = async () => {
+    if (l3ViewMode.value === 'all') {
+      await fetchL3AllGraph()
+      return
+    }
     const currentNodeId = l3StartNode.value?.id
     await _loadGraph(currentNodeId, false)
   }
@@ -432,6 +483,7 @@ export const useMemoryStore = defineStore('memory', () => {
     l3Depth,
     l3MaxNodes,
     l3Layout,
+    l3ViewMode,
     l3Stats,
     l3StatsLoading,
     l3Filters,
@@ -456,6 +508,8 @@ export const useMemoryStore = defineStore('memory', () => {
     searchL2Memory,
     fetchL2Stats,
     fetchL3Graph,
+    fetchL3AllGraph,
+    setViewMode,
     refreshL3Graph,
     expandFromNode,
     navBack,

@@ -24,6 +24,15 @@ _MOTIVE_LABELS = {
     "watch": "跟进评估",
 }
 
+# @ 唤醒活跃窗口内的附加指令：此时对话大概率仍围绕 bot 的回复，
+# 不需要等停顿，也不需要等话题「转向自己」——直接接话即可。
+_WAKE_WINDOW_NOTE = (
+    "\n\n<wake_window>群里刚才有人 @ 了你，接下来这段对话大概率还是在跟你说话。\n"
+    "这段时间不用等别人聊完，也不用等对话出现停顿；只要这条消息跟你有关、"
+    "或者你有话想接、有梗想回，就直接发言（action 设为 \"speak\"）。\n"
+    "只有明显与你无关的内容才跳过。</wake_window>"
+)
+
 _INPUT_SENSITIVE_1026 = re.compile(
     r"(?:input\s+new_sensitive\s*\(\s*1026\s*\)|"
     r"['\"]?message['\"]?\s*:\s*['\"]input\s+new_sensitive|"
@@ -154,6 +163,7 @@ class DecisionRequest:
     wake: str  # "message" | "timer"
     motive: str  # "chime_in" | "follow_up" | "initiate" | "watch"
     quiet_minutes: int = 0  # 仅 initiate 使用
+    wake_window: bool = False  # 处于 @ 唤醒活跃窗口内，判定放宽并倾向发言
 
 
 @dataclass
@@ -219,12 +229,24 @@ class DecisionCore:
         window: SlidingWindow,
         packager: ContextPackager,
         time_hint_get: TimeHintGet | None = None,
+        ignore_senders_get: Callable[[], set[str]] | None = None,
     ) -> None:
         self._config = config
         self._state = state
         self._window = window
         self._packager = packager
         self._time_hint_get = time_hint_get
+        self._ignore_senders_get = ignore_senders_get
+
+    def _ignore_set(self) -> set[str]:
+        """当前生效的主动回复忽略名单（供 prompt 打码）。"""
+        if self._ignore_senders_get is None:
+            return set()
+        try:
+            return set(self._ignore_senders_get() or set())
+        except Exception as e:
+            logger.debug("Iris Reply: ignore list resolve failed: %s", e)
+            return set()
 
     def build_prompt(self, req: DecisionRequest) -> tuple[str, str]:
         """组装 (user_prompt, system_prompt)。"""
@@ -240,6 +262,8 @@ class DecisionCore:
         user_prompt += build_anchor_block(self._state.get_anchor(req.group_id), req.motive)
 
         instruction = MOTIVE_INSTRUCTIONS[req.motive]
+        if req.wake_window:
+            instruction += _WAKE_WINDOW_NOTE
         if req.motive == "initiate":
             instruction = instruction.format(quiet_minutes=max(0, req.quiet_minutes))
             instruction += "\n" + prompts["initiate_style"]
@@ -249,7 +273,12 @@ class DecisionCore:
         user_prompt += f"\n\n<instruction>{instruction}</instruction>"
 
         messages = self._window.get_messages(req.group_id)
-        user_prompt += "\n\n" + self._packager.package(req.group_id, messages, req.motive)
+        user_prompt += "\n\n" + self._packager.package(
+            req.group_id,
+            messages,
+            req.motive,
+            ignore_senders=self._ignore_set(),
+        )
 
         system_prompt = prompts["decision_system"]
         time_hint = wrap_system_reminder(

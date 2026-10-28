@@ -26,6 +26,7 @@ import asyncio
 import hashlib
 import re
 import time
+from pathlib import Path
 from typing import Any, Optional
 
 from .iris_memory.config import init_config, Config
@@ -88,6 +89,7 @@ from .iris_memory.proactive.perception import (
 )
 from .iris_memory.proactive.prompts import SPEAK_HINTS
 from .iris_memory.proactive.proactive import ProactiveEngine
+from .iris_memory.proactive.sender_gate import SenderIgnoreList, extract_ids
 from .iris_memory.proactive.signals import SignalGate
 from .iris_memory.proactive.state import StateManager
 from .iris_memory.proactive.stats import StatsCollector
@@ -104,7 +106,23 @@ PLUGIN_NAME = "astrbot_plugin_iris_memory"
 LEGACY_MIGRATION_ENABLED = True
 
 _IRIS_ACTIVE_TIMEOUT = 120
+# @ 唤醒后的活跃窗口（秒）。窗口内群消息逐条评估是否接话，到期回归常规采样。
+WAKE_WINDOW_SECONDS = 60
 _UMO_KV_KEY = "iris_reply:group_umo"
+
+# 决策模型偶尔会把空值写成这些字面量塞进 watch 字段。
+# 刻意不含 "na" / "n/a"：Lark 的 sender_id 形如 ou_xxx、WebChat 直接拿
+# username 当 user_id，短字母串完全可能是真实 ID，判成垃圾会误删。
+_WATCH_JUNK_VALUES = {"none", "null", "undefined", "无", "空"}
+
+_ID_LIST_SPLIT = re.compile(r"[,，、;；\s|]+")
+
+
+def _split_id_list(raw: str) -> list[str]:
+    """把手写忽略名单原文拆成条目列表（保留原始写法，便于回显给人看）。"""
+    if not raw:
+        return []
+    return [item.strip() for item in _ID_LIST_SPLIT.split(str(raw)) if item.strip()]
 
 _PASSIVE_WATCH_SIGNAL = re.compile(
     r"[?？]|"
@@ -135,6 +153,33 @@ def _detect_passive_trigger(event: AstrMessageEvent, req, context: Context) -> N
             )
     except Exception as e:
         logger.debug(f"被动触发检测异常（不影响正常流程）：{e}")
+
+
+def _resolve_astrbot_config_dir(data_dir: Path | None = None) -> Path | None:
+    """定位 AstrBot 的 data/config 目录，用于读取其他插件的配置文件。
+
+    优先用插件自身数据目录反推：``data/plugin_data/<插件名>`` 往上两级就是
+    ``data``，其下的 ``config`` 即目标目录。这条路径与进程 cwd 无关，
+    在桌面打包、``ASTRBOT_ROOT`` 覆盖、源码运行三种部署下都成立。
+    框架路径工具作为兜底，再失败则返回 None，由调用方跳过同步。
+    """
+    if data_dir is not None:
+        try:
+            candidate = Path(data_dir).parent.parent / "config"
+            if candidate.is_dir():
+                return candidate
+        except Exception:
+            pass
+    try:
+        from astrbot.core.utils.astrbot_path import get_astrbot_config_path
+
+        candidate = Path(get_astrbot_config_path())
+        if candidate.is_dir():
+            return candidate
+    except Exception:
+        pass
+    logger.debug("Iris Reply: 无法定位 AstrBot 配置目录，跳过外部忽略名单同步")
+    return None
 
 
 def _is_pure_at_self(event: AstrMessageEvent) -> bool:
@@ -192,7 +237,18 @@ class IrisMemoryPlugin(Star):
             self._state = StateManager(self._reply_config)
             self._tool_ctx = ToolContext()
             self._gatekeeper = Gatekeeper(self._reply_config, self._state)
+            self._sender_gate = SenderIgnoreList(
+                self._reply_config,
+                config_dir=_resolve_astrbot_config_dir(data_dir),
+            )
+            # Web API 拿不到插件实例，把「当前生效集合」的取值函数注入到
+            # 全局 Config 单例，让忽略名单页面读到的就是运行时真实生效的数据。
+            self.config.set_ignore_snapshot_provider(self._ignore_senders_snapshot)
+            self.config.set_ignore_external_provider(self._ignore_external_snapshot)
             self._sliding_window = SlidingWindow(self._reply_config)
+            # 忽略名单变化时清扫窗口与锚点里的历史残留：否则刚加入名单的
+            # 账号，其旧消息仍会随决策 prompt 送到模型，甚至被写进 watch。
+            self._sender_gate.on_change = self._on_ignore_list_changed
             self._context_packager = ContextPackager(
                 self._reply_config, self_id_get=lambda: self._self_id
             )
@@ -202,6 +258,7 @@ class IrisMemoryPlugin(Star):
                 time_hint_get=lambda gid: resolve_datetime_reminder(
                     self.context, self._group_umo.get(gid),
                 ),
+                ignore_senders_get=self._ignore_senders_snapshot,
             )
             self._admin = AdminCommands(self._state)
             self._stats = StatsCollector()
@@ -233,6 +290,8 @@ class IrisMemoryPlugin(Star):
                 save_fn=lambda: self._state.save_dirty(self._kv_save),
                 on_initiate_sent=self._on_initiate_sent,
                 text_transform=self._strip_initiate_text,
+                watch_filter=self._filter_watch_users,
+                ignore_senders_get=self._ignore_senders_snapshot,
             )
 
             # ── 外部注册动作（依赖就绪后在构造函数末尾统一执行） ──
@@ -534,6 +593,134 @@ class IrisMemoryPlugin(Star):
             or group_id in self._passive_active
         )
 
+    def _is_ignored_sender(self, sender_id: Any, self_id: Any = "") -> bool:
+        """主动回复侧的发送者忽略判定（对旧测试实例保持兼容）。
+
+        ``object.__new__`` 构造的兼容测试实例没有 ``_sender_gate``；
+        此时退化为「不忽略」，不改变任何既有行为。
+        """
+        gate = getattr(self, "_sender_gate", None)
+        if gate is None:
+            return False
+        try:
+            return bool(gate.is_ignored(sender_id, self_id=str(self_id or "")))
+        except Exception as exc:
+            logger.debug(f"Iris Reply: 忽略名单判定异常（已放行）：{exc}")
+            return False
+
+    def _filter_watch_users(self, users: Any) -> list[str]:
+        """移除决策模型给出的、属于忽略名单的关注用户。
+
+        决策 prompt 里能看到被忽略账号的历史消息（滑窗早期残留），模型可能
+        把它们写进 watch。若不过滤，下一次发言就会命中
+        ``match_anchor_user`` → follow_up，等于从决策侧绕过忽略名单。
+        """
+        if not users:
+            return []
+        result: list[str] = []
+        for uid in users:
+            sid = str(uid or "").strip()
+            if not sid or sid in result:
+                continue
+            # 模型常把字面量 "None"/"无" 写进 watch；这类值永远匹配不到真人，
+            # 却会一直挂在锚点上，每轮都参与匹配，直接丢弃。
+            # 注意不要求「必须是纯数字」：非 OneBot 平台（Lark/WebChat 等）
+            # 的 sender_id 不是数字。
+            if sid.lower() in _WATCH_JUNK_VALUES:
+                logger.debug(f"Iris Reply: watch user {sid!r} dropped (placeholder)")
+                continue
+            # 传 self_id：否则 bot 自己的 ID 会被从 watch 里剔掉
+            if self._is_ignored_sender(sid, getattr(self, "_self_id", "")):
+                logger.debug(f"Iris Reply: watch user {sid} dropped (ignored sender)")
+                continue
+            result.append(sid)
+        return result
+
+    def _ignore_senders_snapshot(self) -> set[str]:
+        """当前生效的忽略发送者集合（供 prompt 打码 / initiate 准入）。
+
+        统一在这里剔除自身 ID：``is_ignored``、``package``、``purge_senders``、
+        ``_filter_watch_users``、``_has_substantive`` 五处都消费本方法的结果，
+        一处过滤即可保证语义一致。
+
+        否则用户一旦手滑把 bot 自己的 ID 写进名单：
+        - bot 发起话题后窗口只剩自己那行 → ``_has_substantive`` 为假
+          → 该群被无限重排期、主动发起永久静默（且无任何日志）
+        - bot 的历史发言会被打码，上下文断裂
+        """
+        gate = getattr(self, "_sender_gate", None)
+        if gate is None:
+            return set()
+        try:
+            ids = set(gate.snapshot())
+        except Exception as exc:
+            logger.debug(f"Iris Reply: 忽略名单快照失败（按空处理）：{exc}")
+            return set()
+        self_id = str(getattr(self, "_self_id", "") or "")
+        if self_id:
+            ids.discard(self_id)
+        return ids
+
+    def _ignore_external_snapshot(self) -> set[str]:
+        """从外部黑名单同步来的 ID（供 Web 页面区分来源，旧测试实例返回空集）。"""
+        gate = getattr(self, "_sender_gate", None)
+        if gate is None:
+            return set()
+        try:
+            return gate.external_snapshot()
+        except Exception as exc:
+            logger.debug(f"Iris Reply: 外部同步集合获取失败（按空处理）：{exc}")
+            return set()
+
+    def _on_ignore_list_changed(self, ids: set[str]) -> None:
+        """忽略名单变化后的就地清理（滑窗 + 各群锚点）。
+
+        在读取配置的同步路径上被调用，因此只做内存操作，
+        持久化交给既有的周期保存任务。
+        """
+        window = getattr(self, "_sliding_window", None)
+        state = getattr(self, "_state", None)
+        if window is None or state is None:
+            return
+
+        # 名单被清空时无需清理：purge_senders 传空集合会变成「删掉所有发送者
+        # 的消息」，而 remove_anchor_watch 在 user_ids 为空时会走
+        # ``anchor.clear()`` 分支，把每个群的跟进锚点整体清空。
+        # 那是「名单变空」之外的语义，必须提前返回。
+        if not ids:
+            return
+
+        # 自身 ID 全程豁免：purge / 锚点 / is_ignored / package 语义必须一致。
+        # _self_id 为空（尚未收到过消息）时无法判断哪个是自身，此时保守跳过
+        # 清理，等下一次名单变更或首条消息之后再对齐。
+        self_id = str(getattr(self, "_self_id", "") or "")
+        targets = set(ids)
+        if not self_id:
+            logger.debug(
+                "Iris Reply: 自身 ID 尚未知悉，跳过本次忽略名单清理以免误伤"
+            )
+            return
+        targets.discard(self_id)
+        if not targets:
+            return
+
+        try:
+            removed = window.purge_senders(
+                set(), targets, protected_ids={self_id}
+            )
+        except Exception as exc:
+            logger.debug(f"Iris Reply: 忽略名单清理滑窗失败（已忽略）：{exc}")
+            removed = 0
+        try:
+            for gid in state.get_whitelist():
+                # 显式传非空 user_ids，避免命中 remove_anchor_watch 的
+                # 「两者都为空则整体 clear」分支。
+                state.remove_anchor_watch(gid, user_ids=sorted(targets))
+        except Exception as exc:
+            logger.debug(f"Iris Reply: 忽略名单清理锚点失败（已忽略）：{exc}")
+        if removed:
+            logger.info(f"Iris Reply: 忽略名单生效，已从滑动窗口移除 {removed} 条历史消息")
+
     async def _kv_save(self, key: str, value: Any) -> None:
         await self.put_kv_data(key, value)
 
@@ -672,6 +859,106 @@ class IrisMemoryPlugin(Star):
         result = await self._proactive.attempt_initiate(group_id, force=True)
         event.set_result(f"主动发起: {result}")
 
+    @iris_reply_group.command("ignore")
+    async def cmd_ignore(self, event, action: str = "list", target_id: str = "") -> None:
+        """查看/调整主动回复的发送者忽略名单（管理员）。
+
+        用法：/iris_reply ignore list | add <ID> | remove <ID> | sync
+        """
+        current = self._reply_config.ignore_sender_ids
+        action = (action or "list").strip().lower()
+
+        if action == "list":
+            effective = self._sender_gate.snapshot()
+            ext = "开启" if self._reply_config.ignore_sync_external else "关闭"
+            event.set_result(
+                f"主动回复忽略名单（{len(effective)} 个）\n"
+                f"生效: {', '.join(sorted(effective)) or '无'}\n"
+                f"手写: {current or '无'}\n"
+                f"同步外部黑名单: {ext}"
+            )
+            return
+
+        if action == "sync":
+            self._sender_gate.refresh(force=True)
+            effective = self._sender_gate.snapshot()
+            event.set_result(
+                f"已刷新，当前生效 {len(effective)} 个: "
+                f"{', '.join(sorted(effective)) or '无'}"
+            )
+            return
+
+        if action not in ("add", "remove"):
+            event.set_result("用法：/iris_reply ignore list|add <ID>|remove <ID>|sync")
+            return
+
+        ids = extract_ids([target_id])
+        if not ids:
+            raw = str(target_id or "").strip()
+            # 有内容但解析不出 ID：含字母/下划线说明是非数字 ID
+            # （Lark 的 ou_xxx、WebChat 的 username），明确告知，
+            # 避免用户以为配上了却毫无效果。
+            has_alpha = any(ch.isalpha() or ch == "_" for ch in raw)
+            if raw and has_alpha:
+                event.set_result(
+                    f"「{raw}」不是数字 ID，当前忽略名单只支持数字 ID"
+                    "（OneBot/QQ 等平台）。该平台的发送者暂无法加入忽略名单。"
+                )
+            else:
+                event.set_result(
+                    "请提供有效的用户 ID，例如：/iris_reply ignore add 100000005"
+                )
+            return
+        if len(ids) > 1:
+            # 一条命令写多个 ID 时无法判断「加哪一个」，静默取第一个会让
+            # 用户以为全加了；更糟的是 remove 会连带删掉其他 ID。
+            event.set_result(
+                "请一次只提供一个用户 ID，例如：/iris_reply ignore add 100000005"
+            )
+            return
+        target = next(iter(ids))
+
+        existing = _split_id_list(current)
+        # 手写名单里可能混着 "@昵称(ID)" / "qq:FriendMessage:ID" 等写法，
+        # 比较时统一归一化成纯 ID，避免出现「同一个人写两遍」。
+        # 注意：一个条目里可能含多个 ID（"123/456"），必须用集合判断归属，
+        # 不能用 next(iter(...)) 取单个值 —— set 的迭代顺序不确定。
+        def _entry_ids(item: str) -> set[str]:
+            parsed = extract_ids([item])
+            return parsed or {item.strip()}
+
+        existing_ids = {i for item in existing for i in _entry_ids(item)}
+        if action == "add":
+            if target in existing_ids:
+                event.set_result(f"{target} 已在忽略名单中")
+                return
+            existing.append(target)
+        elif action == "remove":
+            if target not in existing_ids:
+                event.set_result(
+                    f"{target} 不在手写忽略名单中（可能来自外部黑名单同步）"
+                )
+                return
+            kept: list[str] = []
+            for item in existing:
+                entry = _entry_ids(item)
+                if target not in entry:
+                    kept.append(item)
+                    continue
+                # 条目里还有别的 ID：保留它们，不能整条删掉
+                rest = entry - {target}
+                if rest:
+                    kept.append(",".join(sorted(rest)))
+            existing = kept
+
+        self.config.set_hidden("reply_ignore_sender_ids", ",".join(existing))
+        self._sender_gate.refresh(force=True)
+        await self._state.save_dirty(self._kv_save)
+        event.set_result(
+            f"已{'加入' if action == 'add' else '移出'}忽略名单：{target}\n"
+            f"当前生效 {len(self._sender_gate.snapshot())} 个"
+        )
+
     # ========================================================================
     # AstrBot 钩子
     # ========================================================================
@@ -704,6 +991,33 @@ class IrisMemoryPlugin(Star):
         sender_id = event.get_sender_id()
         sender_name = event.get_sender_name() or sender_id
 
+        # 发送者级忽略：被忽略账号的普通群消息不进入滑动窗口、不触发插话/
+        # 跟进采样、也不推进主动发起计时。@ 唤醒 / 唤醒前缀的被动回复不受
+        # 影响（那条通路要正常应答）。这是补在「完全禁用」类黑名单插件之外
+        # 的一层，因为那类插件只在 is_at_or_wake_command 为真时拦截，
+        # 而 Iris 的插话采样读的正是普通群消息。
+        self_id_str = event.get_self_id() or self._self_id
+        ignored_sender = self._is_ignored_sender(sender_id, self_id_str)
+
+        # 被忽略的发送者：普通发言整条跳过（不入窗、不采样、不建立跟进锚点），
+        # 但直接 @ / 唤醒前缀的被动回复仍然照常处理 —— 用户要拦的是「主动回复」，
+        # 不是「被点名也不理」。
+        passive_wake = bool(event.is_at_or_wake_command)
+        if ignored_sender and not passive_wake:
+            # 被忽略账号的发言同样算「有人接话」：消费掉 pending，
+            # 否则 ProactiveEngine 超时后会记成「发起无人接话」，
+            # streak++ → fatigue = 0.4**n，把该群的主动发起系统性压低。
+            if self._state.consume_initiate_pending(group_id):
+                await self._state.save_dirty(self._kv_save)
+            # 仍告知主动发起计时「群里有动静」：否则被忽略账号正在刷屏时
+            # 会被判成冷场，Iris 反而开口发起话题。
+            self._proactive.notify_human_message(group_id, time.time())
+            logger.debug(
+                f"Iris Reply: ignored sender {sender_id} in group {group_id}, "
+                "window/sampling skipped"
+            )
+            return
+
         # 发起后的首次接话：清除 pending，该消息直接获得一次跟进评估资格
         pending_reply = self._state.consume_initiate_pending(group_id)
         is_followed = bool(sender_id and self._state.match_anchor_user(group_id, sender_id))
@@ -725,9 +1039,10 @@ class IrisMemoryPlugin(Star):
         # 每条真实群消息都会使旧主动候选失效，并为该群独立重新预约。
         self._proactive.notify_human_message(group_id, message_timestamp)
 
-        if event.is_at_or_wake_command:
+        if passive_wake:
             self._release_decision_ticket(group_id)
             self._state.increment_msg_count(group_id)
+            self._state.open_wake_window(group_id, WAKE_WINDOW_SECONDS)
             self._passive_active[group_id] = time.time()
             event.set_extra("iris_mode", "passive")
             return
@@ -752,7 +1067,11 @@ class IrisMemoryPlugin(Star):
                 return
             self._follow_pending.add(group_id)
             try:
-                await asyncio.sleep(self._reply_config.follow_up_aggregate_window)
+                # @ 唤醒窗口内话题正围绕 bot，不排队聚合，只留极短间隔避免连发
+                if self._state.in_wake_window(group_id):
+                    await asyncio.sleep(1)
+                else:
+                    await asyncio.sleep(self._reply_config.follow_up_aggregate_window)
             finally:
                 self._follow_pending.discard(group_id)
 
@@ -936,7 +1255,12 @@ class IrisMemoryPlugin(Star):
                 event.stop_event()
                 return True
 
-        req = DecisionRequest(group_id=group_id, wake="message", motive=motive)
+        req = DecisionRequest(
+            group_id=group_id,
+            wake="message",
+            motive=motive,
+            wake_window=self._state.in_wake_window(group_id),
+        )
         outcome = await self._decision_core.decide(req, self._llm_manager, provider_id)
 
         if outcome.error or outcome.decision is None:
@@ -1027,7 +1351,11 @@ class IrisMemoryPlugin(Star):
             event.stop_event()
             return True
 
-        if decision.watch or decision.watch_keywords:
+        # 决策模型可能把忽略名单里的账号写进 watch；这里统一清洗一次，
+        # 保证「被忽略的账号不会成为关注对象」在决策侧也成立。
+        filtered_watch = self._filter_watch_users(decision.watch)
+        decision.watch = filtered_watch
+        if filtered_watch or decision.watch_keywords:
             if decision.should_speak:
                 event.set_extra("iris_pending_watch", (
                     decision.watch, decision.watch_keywords, decision.why,
@@ -1199,10 +1527,19 @@ class IrisMemoryPlugin(Star):
                 content=bot_text,
                 timestamp=time.time(),
             ))
+        # 被忽略的发送者不写关注锚点：否则他的下一条发言会命中
+        # match_anchor_user → follow_up → 主动跟进，等于绕开忽略名单。
+        # 但机器人自己的发言仍要入窗（上面已追加），保证上下文完整。
+        if self._is_ignored_sender(sender_id, event.get_self_id() or self._self_id):
+            logger.debug(
+                f"Iris Reply: ignored sender {sender_id} in group {group_id}, "
+                "anchor skipped"
+            )
+            return
         mode = event.get_extra("iris_mode")
         if mode in ("chime_in", "follow_up"):
             pending = event.get_extra("iris_pending_watch")
-            users = list(pending[0]) if pending else []
+            users = self._filter_watch_users(list(pending[0]) if pending else [])
             if sender_id not in users:
                 users.append(sender_id)
             keywords = list(pending[1]) if pending else []
@@ -1323,6 +1660,11 @@ class IrisMemoryPlugin(Star):
             return
 
         decision = outcome.decision
+        # 决策侧 watch 清洗：被忽略账号不进入关注锚点，
+        # 否则下一次他发消息就会命中 match_anchor_user 触发跟进。
+        decision.watch = self._filter_watch_users(decision.watch)
+        # 兜底锚点（模型没给 watch 时用触发者）同样不能落在忽略账号上
+        fallback_users = self._filter_watch_users([fallback_sender])
         self._stats.record_decision(
             group_id, "watch",
             system_prompt=outcome.system_prompt,
@@ -1341,7 +1683,8 @@ class IrisMemoryPlugin(Star):
                 self._state.set_observation(group_id, decision.observation)
             if decision.parse_failed:
                 self._state.write_anchor(
-                    group_id, kind="passive", bot_message=bot_text, users=[fallback_sender],
+                    group_id, kind="passive", bot_message=bot_text,
+                    users=fallback_users or None,
                 )
             elif decision.drifted:
                 self._state.close_anchor(group_id)
@@ -1358,7 +1701,8 @@ class IrisMemoryPlugin(Star):
                 )
             else:
                 self._state.write_anchor(
-                    group_id, kind="passive", bot_message=bot_text, users=[fallback_sender],
+                    group_id, kind="passive", bot_message=bot_text,
+                    users=fallback_users or None,
                 )
         await self._state.save_dirty(self._kv_save)
 

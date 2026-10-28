@@ -85,6 +85,31 @@
           图谱控制
         </div>
 
+        <!-- 视图模式：聚焦（单起点扩展） / 全图（整库概览） -->
+        <div class="mb-3">
+          <span class="text-caption text-medium-emphasis">视图模式</span>
+          <v-btn-toggle
+            :model-value="viewMode"
+            mandatory
+            density="compact"
+            color="primary"
+            class="w-100 mt-1"
+            @update:model-value="(v: any) => emit('update:viewMode', v as 'focus' | 'all')"
+          >
+            <v-btn value="focus" size="x-small" class="flex-grow-1">
+              <v-icon icon="mdi-image-filter-center-focus" size="x-small" class="mr-1" />
+              聚焦模式
+            </v-btn>
+            <v-btn value="all" size="x-small" class="flex-grow-1">
+              <v-icon icon="mdi-map-outline" size="x-small" class="mr-1" />
+              全图模式
+            </v-btn>
+          </v-btn-toggle>
+          <div class="text-caption text-disabled mt-1">
+            {{ viewMode === 'all' ? '展示整个知识图谱，看清所有人物与关联' : '从起始节点向外扩展展示' }}
+          </div>
+        </div>
+
         <!-- 群聊过滤 -->
         <div class="mb-3">
           <span class="text-caption text-medium-emphasis">群聊范围</span>
@@ -103,7 +128,7 @@
           />
         </div>
 
-        <div class="mb-3">
+        <div v-if="viewMode === 'focus'" class="mb-3">
           <div class="d-flex justify-space-between align-center">
             <span class="text-caption text-medium-emphasis">拓展深度</span>
             <v-chip size="x-small" variant="tonal">{{ depth }} 跳</v-chip>
@@ -120,7 +145,7 @@
           />
         </div>
 
-        <div class="mb-3">
+        <div v-if="viewMode === 'focus'" class="mb-3">
           <div class="d-flex justify-space-between align-center">
             <span class="text-caption text-medium-emphasis">最大节点数</span>
             <v-chip size="x-small" variant="tonal">{{ maxNodes }}</v-chip>
@@ -154,9 +179,29 @@
           <v-btn value="concentric" size="x-small" class="flex-grow-1">同心</v-btn>
         </v-btn-toggle>
 
-        <v-btn color="primary" variant="tonal" block size="small" :loading="loading" @click="emit('random-node')">
+        <v-btn
+          v-if="viewMode === 'focus'"
+          color="primary"
+          variant="tonal"
+          block
+          size="small"
+          :loading="loading"
+          @click="emit('random-node')"
+        >
           <v-icon icon="mdi-shuffle" class="mr-1" />
           随机主节点
+        </v-btn>
+        <v-btn
+          v-else
+          color="primary"
+          variant="tonal"
+          block
+          size="small"
+          :loading="loading"
+          @click="emit('refresh-all')"
+        >
+          <v-icon icon="mdi-refresh" class="mr-1" />
+          刷新全图
         </v-btn>
       </v-card-text>
     </v-card>
@@ -327,6 +372,7 @@ const props = defineProps<{
   depth: number
   maxNodes: number
   layout: L3LayoutType
+  viewMode: 'focus' | 'all'
   minConfidence: number
   availableNodeTypes: { type: string; count: number }[]
   availableRelationTypes: { type: string; count: number }[]
@@ -345,12 +391,14 @@ const emit = defineEmits<{
   'update:depth': [depth: number]
   'update:maxNodes': [maxNodes: number]
   'update:layout': [layout: L3LayoutType]
+  'update:viewMode': [mode: 'focus' | 'all']
   'update:minConfidence': [v: number]
   'update:groupId': [groupId: string | null]
   'toggle-node-type': [type: string]
   'toggle-relation-type': [type: string]
   'reset-filters': []
   'random-node': []
+  'refresh-all': []
   'focus-node': [nodeId: string]
 }>()
 

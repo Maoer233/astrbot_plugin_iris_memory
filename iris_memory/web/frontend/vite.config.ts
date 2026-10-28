@@ -214,7 +214,9 @@ export default defineConfig({
     sourcemap: false,
     chunkSizeWarningLimit: 600,
     cssCodeSplit: false,
-    minify: 'terser',
+    // 本地环境（16GB）下 terser 压缩 graph-vendor 大 chunk 必然 OOM，
+    // 改用 vite 8 内置的 oxc 压缩器（Rust 原生），内存占用低一个数量级。
+    minify: 'oxc',
     terserOptions: {
       compress: {
         drop_console: true,
@@ -232,9 +234,11 @@ export default defineConfig({
     },
     rollupOptions: {
       output: {
-        entryFileNames: 'iris.js',
+        // 入口/样式带 hash：避免浏览器缓存固定文件名 iris.js 后，
+        // 引用已被 emptyOutDir 清除的旧 chunk 导致整个页面黑屏。
+        entryFileNames: 'iris-[hash].js',
         chunkFileNames: 'chunks/[name]-[hash].js',
-        assetFileNames: 'iris.[ext]',
+        assetFileNames: 'iris-[hash].[ext]',
         manualChunks(id) {
           if (!id.includes('node_modules')) return undefined
           if (id.includes('cytoscape')) return 'graph-vendor'

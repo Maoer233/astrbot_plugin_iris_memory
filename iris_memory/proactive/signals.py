@@ -41,6 +41,13 @@ class SignalGate:
             self._state.reset_sampling(group_id)
             return "follow_up"
 
+        # @ 唤醒后的活跃窗口：话题正围绕 bot 的回复，逐条消息都值得评估一次，
+        # 不再等采样阈值凑够。窗口由 main.py 在 @ 时开启，到期自动回归观察。
+        if self._state.in_wake_window(group_id):
+            logger.debug("Iris Reply: wake window trigger for group %s", group_id)
+            self._state.reset_sampling(group_id)
+            return "chime_in"
+
         self._state.increment_msg_count(group_id)
         if self._state.should_trigger_sampling(group_id):
             logger.debug("Iris Reply: sampling trigger for group %s", group_id)

@@ -2,7 +2,11 @@
   <div class="canvas-wrapper">
     <div class="canvas-toolbar">
       <div class="toolbar-left">
-        <v-btn-group density="compact" variant="tonal">
+        <v-btn-group
+          v-if="viewMode === 'focus'"
+          density="compact"
+          variant="tonal"
+        >
           <v-btn icon="mdi-undo-variant" size="small" :disabled="!canGoBack" @click="emit('nav-back')">
             <v-tooltip activator="parent" location="bottom">后退</v-tooltip>
           </v-btn>
@@ -11,16 +15,20 @@
           </v-btn>
         </v-btn-group>
 
-        <v-btn-group density="compact" variant="tonal" class="ml-2">
+        <v-btn-group density="compact" variant="tonal" :class="{ 'ml-2': viewMode === 'focus' }">
           <v-btn icon="mdi-magnify-plus" size="small" @click="zoomBy(1.25)" />
           <v-btn icon="mdi-magnify-minus" size="small" @click="zoomBy(0.8)" />
           <v-btn icon="mdi-fit-to-screen" size="small" @click="fitView" />
           <v-btn icon="mdi-image-filter-center-focus" size="small" @click="fitCenter" />
         </v-btn-group>
 
-        <v-chip v-if="startNode" size="small" color="accent" variant="tonal" class="ml-2">
+        <v-chip v-if="startNode && viewMode === 'focus'" size="small" color="accent" variant="tonal" class="ml-2">
           <v-icon :icon="getNodeIcon(startNode.label)" start size="small" />
           {{ startNode.name }}
+        </v-chip>
+        <v-chip v-else-if="viewMode === 'all'" size="small" color="info" variant="tonal" class="ml-2">
+          <v-icon icon="mdi-map-outline" start size="small" />
+          全库视图
         </v-chip>
       </div>
 
@@ -82,6 +90,7 @@ const props = defineProps<{
   loading: boolean
   startNode: KGNode | null
   layout: L3LayoutType
+  viewMode: 'focus' | 'all'
   canGoBack: boolean
   canGoForward: boolean
 }>()
@@ -280,6 +289,8 @@ const layoutConfig = (type: L3LayoutType, nodeCount: number): LayoutOptions => {
         gravity: 0.25,
         numIter: 2500,
         tile: true,
+        // 多连通分量图（星型小团）各自聚团、彼此拉开，避免糊成一团
+        componentSpacing: nodeCount > 40 ? 120 : 80,
         randomize: true,
       } as any
   }
@@ -289,12 +300,13 @@ const layoutConfig = (type: L3LayoutType, nodeCount: number): LayoutOptions => {
 const toElements = (): ElementDefinition[] => {
   const degrees = computeDegrees()
   const maxDeg = Math.max(1, ...degrees.values())
-  const showAllLabels = props.nodes.length <= 15
+  // 标签策略：节点少全显；节点多时 Person（信息主体）恒显，其余 deg>=2 才显示
+  const showAllLabels = props.nodes.length <= 40
 
   const nodes: ElementDefinition[] = props.nodes.map((n) => {
     const deg = degrees.get(n.id) || 0
     const size = 28 + (deg / maxDeg) * 18
-    const showLabel = showAllLabels || deg >= 2
+    const showLabel = showAllLabels || n.label === 'Person' || deg >= 2
     return {
       data: {
         id: n.id,
