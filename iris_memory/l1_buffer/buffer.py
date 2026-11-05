@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from typing import Optional, Dict, Any, List, TYPE_CHECKING, cast
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 import asyncio
 import re
 
@@ -91,6 +91,9 @@ class L1Buffer(Component):
         self._queues: Dict[str, SegmentedMessageQueue] = {}
         self._image_queues: Dict[str, List[Any]] = {}
         self._image_queue_lock = asyncio.Lock()
+        # 会话级「图片状态已变化」事件：解析完成/失败时置位，
+        # 供 wait_for_recent_images 阻塞等待，避免忙轮询。
+        self._image_events: Dict[str, asyncio.Event] = {}
         self._summarizer: Optional[Summarizer] = None
         self._component_manager: Optional["ComponentManager"] = None
         self._provider: str = ""
@@ -1579,8 +1582,18 @@ class L1Buffer(Component):
         return True
 
     def prepend_to_last_message(
-        self, group_id: str, prefix: str, same_source: str = ""
+        self, group_id: str, prefix: str, same_source: str = "", message_id: str = ""
     ) -> bool:
+        """把文本前置到消息内容前面。
+
+        Args:
+            group_id: 会话 ID
+            prefix: 要前置的文本
+            same_source: 限定只合并该发送者的消息（空则不限制）
+            message_id: 精确指定目标消息（空则取最后一条）。
+                图片流水线跑完时，L1 末尾往往已是别人的发言，
+                按 message_id 定位才能把 [图:...] 挂回图片本身那条消息。
+        """
         if not self._is_available:
             return False
 
@@ -1589,14 +1602,28 @@ class L1Buffer(Component):
             return False
 
         queue = self._queues[queue_key]
-        if queue.segment_1:
-            last_msg = queue.segment_1[-1]
-        elif queue.segment_2:
-            last_msg = queue.segment_2[-1]
-        elif queue.segment_3:
-            last_msg = queue.segment_3[-1]
-        else:
-            return False
+        last_msg = None
+
+        if message_id:
+            target_id = str(message_id)
+            for msg in reversed(queue.all_messages):
+                if str((msg.metadata or {}).get("message_id", "")) == target_id:
+                    last_msg = msg
+                    break
+            if last_msg is None:
+                logger.debug(
+                    f"未找到 message_id={target_id} 的消息，退化为末条合并"
+                )
+
+        if last_msg is None:
+            if queue.segment_1:
+                last_msg = queue.segment_1[-1]
+            elif queue.segment_2:
+                last_msg = queue.segment_2[-1]
+            elif queue.segment_3:
+                last_msg = queue.segment_3[-1]
+            else:
+                return False
 
         if same_source and last_msg.source != same_source:
             return False
@@ -1609,8 +1636,8 @@ class L1Buffer(Component):
         queue.total_tokens += token_diff
 
         logger.debug(
-            f"已前置文本到最后消息：{queue_key}, 前置长度={len(prefix)}, "
-            f"token差={token_diff}"
+            f"已前置文本到消息：{queue_key}, 前置长度={len(prefix)}, "
+            f"token差={token_diff}, by_message_id={bool(message_id)}"
         )
         return True
 
@@ -1641,6 +1668,10 @@ class L1Buffer(Component):
                     f"已替换图片占位符：{queue_key}, "
                     f"{placeholder} -> {description[:30]}..."
                 )
+
+        if replaced:
+            # 占位符已变成真实描述：唤醒等待中的 LLM 请求
+            self._notify_image_state_changed(queue_key)
 
         return replaced
 
@@ -1675,6 +1706,116 @@ class L1Buffer(Component):
             images = images[:limit]
 
         return images
+
+    def _get_image_event(self, queue_key: str) -> asyncio.Event:
+        """取得（或创建）会话级图片状态事件。"""
+        event = self._image_events.get(queue_key)
+        if event is None:
+            event = asyncio.Event()
+            self._image_events[queue_key] = event
+        return event
+
+    def _notify_image_state_changed(self, queue_key: str) -> None:
+        """唤醒等待中的 LLM 请求（解析完成/失败时调用）。"""
+        event = self._image_events.get(queue_key)
+        if event is not None:
+            event.set()
+
+    def count_unresolved_recent_images(
+        self, group_id: str, window_seconds: float
+    ) -> int:
+        """统计窗口内仍未出结果的图片数量。
+
+        两个来源都要算，缺一不可：
+
+        1. **图片队列**里的 PENDING / PROCESSING 项（还没开始解析）
+        2. **L1 消息内容**里残留的 ``[IMG:...]`` 占位符（解析中或已失败未替换）
+
+        只看图片队列是不够的：图片解析完成后队列项变成 SUCCESS，
+        但如果此时占位符还没替换进 L1（或替换失败），模型仍然看不到图。
+        反过来只看占位符也不够：图片刚入队、占位符尚未写入时队列才是准的。
+
+        DEFERRED（配额耗尽等）不阻塞请求，否则配额一空每条消息都要等满超时。
+        """
+        from ..image import ImageParseStatus
+
+        queue_key = self._get_queue_key(group_id)
+        cutoff = datetime.now() - timedelta(seconds=max(0.0, window_seconds))
+
+        pending_in_queue = 0
+        for img in self._image_queues.get(queue_key) or []:
+            if getattr(img, "timestamp", None) is None:
+                continue
+            if img.timestamp < cutoff:
+                continue
+            if img.status in (
+                ImageParseStatus.PENDING,
+                ImageParseStatus.PROCESSING,
+            ):
+                pending_in_queue += 1
+
+        # L1 里残留的占位符：这些图已经入队但描述还没写回去
+        placeholder_msgs = 0
+        queue = self._queues.get(queue_key)
+        if queue is not None:
+            for msg in queue.all_messages:
+                if "[IMG:" in (msg.content or ""):
+                    placeholder_msgs += 1
+
+        return max(pending_in_queue, placeholder_msgs)
+
+    async def wait_for_recent_images(
+        self,
+        group_id: str,
+        *,
+        window_seconds: float = 10.0,
+        timeout_seconds: float = 8.0,
+    ) -> int:
+        """等待窗口内的图片解析完成，返回超时时仍未完成的数量。
+
+        用途：用户「发图 + 紧跟着说话」时，图片解析在后台异步进行，
+        若 LLM 请求抢在前面，模型只看得到 ``[IMG:hash]`` 占位符。
+        在注入上下文前调用本方法，让这一轮能带上图片描述。
+
+        只在**确实有未完成图片**时才等待，纯文字消息零开销。
+        """
+        if timeout_seconds <= 0:
+            return self.count_unresolved_recent_images(group_id, window_seconds)
+
+        remaining = self.count_unresolved_recent_images(group_id, window_seconds)
+        if remaining <= 0:
+            return 0
+
+        queue_key = self._get_queue_key(group_id)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_seconds
+
+        while remaining > 0:
+            left = deadline - loop.time()
+            if left <= 0:
+                break
+
+            # 顺序很重要：先取 event、clear、再复查状态。
+            # 若先复查再 clear，状态恰好在两步之间变化时通知会被 clear 吞掉，
+            # 导致必须等满超时（实测过 8000ms 才返回的竞态）。
+            event = self._get_image_event(queue_key)
+            event.clear()
+
+            remaining = self.count_unresolved_recent_images(
+                group_id, window_seconds
+            )
+            if remaining <= 0:
+                break
+
+            left = deadline - loop.time()
+            if left <= 0:
+                break
+            try:
+                await asyncio.wait_for(event.wait(), timeout=left)
+            except asyncio.TimeoutError:
+                break
+
+        return remaining
 
     async def claim_pending_images(
         self,
@@ -1752,6 +1893,8 @@ class L1Buffer(Component):
                     f"图片状态已更新：{queue_key}, hash={image_hash[:8]}..., "
                     f"status={status.value}"
                 )
+                # 唤醒正在等待这张图完成的 LLM 请求
+                self._notify_image_state_changed(queue_key)
                 return True
 
         return False
@@ -1779,6 +1922,8 @@ class L1Buffer(Component):
             img.claim_token = ""
             img.claimed_at = None
             img.next_attempt_at = next_attempt_at
+            # 状态已变化：唤醒等待方，避免其空等到超时
+            self._notify_image_state_changed(queue_key)
             return True
         return False
 

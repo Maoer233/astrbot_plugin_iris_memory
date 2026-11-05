@@ -851,10 +851,14 @@ class TestParseImagesAllModeIndexAlignment:
         assert marked.get("hash_nourl") == ImageParseStatus.FAILED
         assert marked.get("hash_url") == ImageParseStatus.SUCCESS
 
-        # img_nourl 的占位符被清空
+        # img_nourl 被标记 FAILED 占位符替换为「无法识别」。
+        # 早期实现是清空（""），那样模型看到空字符串，等于不知道有人发过图；
+        # 改为可读占位后至少能表达「这里本该有图但读不出来」。
         replace_calls = l1_buffer.replace_image_placeholder.call_args_list
         replaced = {c[0][1]: c[0][2] for c in replace_calls}
-        assert replaced.get("[IMG:hash_nourl]") == "", "无 URL 项占位符应清空"
+        assert replaced.get("[IMG:hash_nourl]") == "[图:无法识别]", (
+            "无 URL 项应替换为无法识别占位"
+        )
         assert replaced.get("[IMG:hash_url]") == "[图:这是 URL 图片的描述]", (
             "有 URL 项占位符应替换为解析结果"
         )

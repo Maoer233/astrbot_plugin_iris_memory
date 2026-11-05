@@ -632,10 +632,58 @@ class HiddenConfig:
         default=True,
         metadata={"description": "被动触发时跳过图片解析", "group": "图片处理"},
     )
+    # 跨消息图片承接：平台会把「图片」与随后的「文字」拆成两条消息，
+    # AstrBot 只采集当前消息的 Image 段，导致文字那条请求看不到图。
+    # 开启后，同人同会话时间窗内的图会补进 req.image_urls。
+    image_carryover_enable: bool = field(
+        default=True,
+        metadata={
+            "description": "跨消息承接图片（图片与文字分两条消息时补图）",
+            "group": "图片处理",
+        },
+    )
+    image_carryover_max_age_seconds: int = field(
+        default=60,
+        metadata={"description": "跨消息承接图片的时间窗（秒）", "group": "图片处理"},
+    )
+    image_carryover_max_per_session: int = field(
+        default=5,
+        metadata={"description": "每会话近期图片登记条数上限", "group": "图片处理"},
+    )
+    image_carryover_require_reference_word: bool = field(
+        default=True,
+        metadata={
+            "description": "仅在消息含指代词时才承接图片（更省 token）",
+            "group": "图片处理",
+        },
+    )
     image_parse_timeout_ms: int = field(
         default=30000,
         metadata={
             "description": "单次请求图片解析整体超时(ms)，0 表示不限制",
+            "group": "图片处理",
+        },
+    )
+    image_wait_parse_enable: bool = field(
+        default=True,
+        metadata={
+            "description": "LLM 请求前等待近期未完成解析的图片就绪，"
+            "避免「发图+说话」被抢跑导致模型看不到图",
+            "group": "图片处理",
+        },
+    )
+    image_wait_parse_timeout_ms: int = field(
+        default=8000,
+        metadata={
+            "description": "等待图片解析的最长时间(ms)。超时则先回复，"
+            "图片描述留待下一轮；设为 0 表示不等待",
+            "group": "图片处理",
+        },
+    )
+    image_wait_parse_window_seconds: int = field(
+        default=10,
+        metadata={
+            "description": "只等待这么多秒内收到的图片，更早的图片不再等待",
             "group": "图片处理",
         },
     )

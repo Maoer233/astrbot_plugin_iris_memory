@@ -234,6 +234,12 @@ async def preprocess_llm_request(
     elif hasattr(event, "get_message_str"):
         user_message = event.get_message_str()
 
+    # 跨消息图片承接：平台把「图片」和随后的「文字」拆成两条消息，
+    # AstrBot 只采集当前消息的 Image 段，导致文字这条请求看不到图。
+    # 这里在构造请求后、注入上下文前，把同人同会话 60 秒内的图补进
+    # req.image_urls，走同步多模态通道（不消耗图片解析配额）。
+    _merge_carryover_image(event, req, user_message, inject_meta["image"])
+
     l1_task = asyncio.create_task(
         _run_stage(
             "l1",
@@ -332,6 +338,118 @@ async def _run_stage(
         return fallback
     finally:
         meta["duration_ms"] = _elapsed_ms(started)
+
+
+def _merge_carryover_image(
+    event: "AstrMessageEvent",
+    req: "ProviderRequest",
+    user_message: str,
+    meta: dict,
+) -> None:
+    """把「紧邻上文里同一个人发的图」并入当代请求的多模态输入。
+
+    背景：``collect_initial_request`` 只遍历当前消息的消息段，而平台会把
+    图片与随后的文字拆成两条消息推送，于是文字那条事件的
+    ``req.image_urls`` 为空，模型看不到图。
+
+    放行条件（全部满足才合并）：
+
+    1. ``image_carryover_enable`` 打开；
+    2. 当前消息``有文字``（纯图消息走原生路径，无需合并）；
+    3. 当前消息``自己没有图片``（已有图时不覆盖用户本意）；
+    4. 若开启 ``image_carryover_require_reference_word``，文字需含指代词
+       （这个/图里/怎么用…），避免「A 发图 → B 说今天好热」误合并。
+
+    命中后把图片引用追加到 ``req.image_urls``；该引用是**本地路径或 URL**，
+    与 ``prepare_request_images`` 的入参格式一致，不会重复下载已知路径。
+
+    全过程故障隔离：任何异常只记 debug，绝不影响请求构造。
+    """
+    try:
+        from ..config import get_config
+
+        config = get_config()
+        if not config.get("image_carryover_enable"):
+            meta["carryover"] = "disabled"
+            return
+
+        text = str(user_message or "").strip()
+        if not text:
+            meta["carryover"] = "no_text"
+            return
+
+        if getattr(req, "image_urls", None):
+            meta["carryover"] = "already_has_image"
+            return
+
+        # ProviderRequest.image_urls 默认是 list；若被上游置为 None 则先补空列表，
+        # 否则后面的 append 会抛 AttributeError（会被本函数兜住，但会丢图）。
+        if getattr(req, "image_urls", None) is None:
+            try:
+                req.image_urls = []
+            except Exception:
+                meta["carryover"] = "image_urls_readonly"
+                return
+
+        if bool(config.get("image_carryover_require_reference_word", True)):
+            from ..image import looks_like_reference
+
+            if not looks_like_reference(text):
+                meta["carryover"] = "no_reference_word"
+                return
+
+        from ..platform import get_adapter
+
+        adapter = get_adapter(event)
+        session_id = adapter.get_session_id(event)
+        user_id = adapter.get_user_id(event)
+        if not session_id or not user_id:
+            meta["carryover"] = "no_session_or_user"
+            return
+
+        from ..image import get_recent_image_registry
+
+        registry = get_recent_image_registry()
+        entry = registry.take(
+            session_id=session_id,
+            user_id=user_id,
+            max_age_seconds=float(
+                config.get("image_carryover_max_age_seconds", 60) or 60
+            ),
+        )
+        if entry is None:
+            meta["carryover"] = "no_recent_image"
+            return
+
+        # 本地路径需存在；URL 交给 AstrBot 自行下载
+        ref = entry.ref
+        if not ref.startswith(("http://", "https://", "base64://", "data:")):
+            try:
+                from pathlib import Path
+
+                if not Path(ref).is_file():
+                    meta["carryover"] = "file_missing"
+                    logger.info(
+                        "承接图片的本地文件已不存在，跳过：%s", ref
+                    )
+                    return
+            except OSError:
+                meta["carryover"] = "file_unreadable"
+                return
+
+        req.image_urls.append(ref)
+        meta["carryover"] = "merged"
+        meta["carryover_message_id"] = entry.message_id
+        logger.info(
+            "跨消息承接图片已并入本轮请求 session=%s user=%s msg=%s ref=%s",
+            session_id,
+            user_id,
+            entry.message_id,
+            ref[:120],
+        )
+    except Exception as e:
+        meta["carryover"] = f"error:{e}"
+        logger.debug(f"跨消息图片承接失败（不影响主流程）：{e}")
 
 
 def _schedule_related_image_parse(
@@ -721,6 +839,35 @@ async def _collect_l1_context(
 
     # schema hint 承诺「最少 20 条」，此处夹紧保证行为与提示一致
     max_length = max(20, cast(int, config.get("l1_buffer.inject_queue_length", 50)))
+
+    # 等待近期图片解析完成，避免「发图 + 紧跟说话」时模型只看得到占位符。
+    # 必须在 get_context 之前：占位符替换发生在解析完成后，先等再读才拿得到描述。
+    # 只在确实存在未完成图片时才阻塞，纯文字消息零额外延迟。
+    if config.get("image_wait_parse_enable", True):
+        timeout_ms = int(config.get("image_wait_parse_timeout_ms", 8000) or 0)
+        window_s = int(config.get("image_wait_parse_window_seconds", 10) or 10)
+        if timeout_ms > 0 and window_s > 0:
+            waiter = getattr(l1_buffer, "wait_for_recent_images", None)
+            if waiter is not None:
+                try:
+                    pending = await waiter(
+                        session_id,
+                        window_seconds=window_s,
+                        timeout_seconds=timeout_ms / 1000.0,
+                    )
+                    if pending:
+                        logger.info(
+                            f"图片解析等待超时，{pending} 张仍未完成，先用现有上下文回复"
+                        )
+                    if meta is not None:
+                        meta["image_wait"] = {
+                            "timeout_ms": timeout_ms,
+                            "window_s": window_s,
+                            "pending_after": pending,
+                        }
+                except Exception as e:
+                    # 等待失败绝不影响主流程
+                    logger.warning(f"等待图片解析失败，已忽略：{e}")
 
     messages = l1_buffer.get_context(session_id, max_length)
     if not messages:

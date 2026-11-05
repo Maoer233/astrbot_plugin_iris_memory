@@ -46,24 +46,24 @@ def _write_external(config_dir, payload: dict) -> None:
 class TestExtractIds:
     def test_mixed_forms(self):
         raw = [
-            "100000005",
-            "qq:FriendMessage:100000000",
-            "@茧墨（肥鱼版）(100000005)",
+            "1000000001",
+            "qq:FriendMessage:1000000006",
+            "@茧墨（肥鱼版）(1000000001)",
         ]
-        assert extract_ids(raw) == {"100000005", "100000000"}
+        assert extract_ids(raw) == {"1000000001", "1000000006"}
 
     def test_nickname_with_extra_digits(self):
         # 昵称里带年份时，必须取最后一段数字（括号内真实 ID）
         assert extract_ids(["@玩家2024(1234567)"]) == {"1234567"}
 
     def test_separators(self):
-        assert extract_ids("100000005,100000000") == {"100000005", "100000000"}
-        assert extract_ids("100000005\n100000000") == {"100000005", "100000000"}
-        assert extract_ids("100000005 100000000") == {"100000005", "100000000"}
+        assert extract_ids("1000000001,1000000002") == {"1000000001", "1000000002"}
+        assert extract_ids("1000000001\n1000000002") == {"1000000001", "1000000002"}
+        assert extract_ids("1000000001 1000000002") == {"1000000001", "1000000002"}
         # 斜杠/加号/与号也要能拆开，否则前一个 ID 会被吞掉
-        assert extract_ids("100000005/100000000") == {"100000005", "100000000"}
-        assert extract_ids("100000005+100000000") == {"100000005", "100000000"}
-        assert extract_ids("100000005&100000000") == {"100000005", "100000000"}
+        assert extract_ids("1000000001/1000000002") == {"1000000001", "1000000002"}
+        assert extract_ids("1000000001+1000000002") == {"1000000001", "1000000002"}
+        assert extract_ids("1000000001&1000000002") == {"1000000001", "1000000002"}
 
     @pytest.mark.parametrize("raw", [None, "", "  ", "None", "abc"])
     def test_no_id_returns_empty(self, raw):
@@ -87,13 +87,13 @@ class TestExtractIds:
 
     def test_paren_id_wins_over_trailing_digits(self):
         """括号后的额外数字不能覆盖括号里的真 ID。"""
-        assert extract_ids(["@茧墨(100000005)123456"]) == {"100000005"}
+        assert extract_ids(["@茧墨(1000000001)123456"]) == {"1000000001"}
 
     def test_at_prefixed_bare_id(self):
-        assert extract_ids(["@100000005"]) == {"100000005"}
+        assert extract_ids(["@1000000001"]) == {"1000000001"}
 
     def test_fullwidth_colon(self):
-        assert extract_ids(["qq：100000000"]) == {"100000000"}
+        assert extract_ids(["qq：1000000006"]) == {"1000000006"}
 
     @pytest.mark.parametrize(
         ("raw", "expected"),
@@ -101,10 +101,10 @@ class TestExtractIds:
             # 顺序必须对称：@昵称(ID) 在前时，后面的裸数字也是独立条目
             ("888888, @某人(999999)", {"888888", "999999"}),
             ("@某人(999999),888888", {"888888", "999999"}),
-            ("@茧墨（肥鱼版）(100000005),100000000", {"100000005", "100000000"}),
+            ("@茧墨（肥鱼版）(1000000001),1000000002", {"1000000001", "1000000002"}),
             (
-                "@茧墨（肥鱼版）(100000005)\n100000000\n100000000",
-                {"100000005", "100000000", "100000000"},
+                "@茧墨（肥鱼版）(1000000001)\n1000000002\n1000000006",
+                {"1000000001", "1000000002", "1000000006"},
             ),
         ],
     )
@@ -121,35 +121,35 @@ class TestExternalSync:
     def test_blacklist_mode_syncs(self, tmp_path):
         _write_external(
             tmp_path,
-            {"mode": "blacklist", "disable_list": ["100000005", "@茧墨(1234567)"]},
+            {"mode": "blacklist", "disable_list": ["1000000001", "@茧墨(1234567)"]},
         )
         gate = SenderIgnoreList(_Cfg(), config_dir=tmp_path)
-        assert gate.snapshot() == {"100000005", "1234567"}
-        assert gate.is_ignored("100000005")
+        assert gate.snapshot() == {"1000000001", "1234567"}
+        assert gate.is_ignored("1000000001")
         assert not gate.is_ignored("999")
 
     def test_whitelist_mode_does_not_sync(self, tmp_path):
         # 白名单模式下列表语义相反，同步会把「除了名单内的人」全忽略
-        _write_external(tmp_path, {"mode": "whitelist", "disable_list": ["100000005"]})
+        _write_external(tmp_path, {"mode": "whitelist", "disable_list": ["1000000001"]})
         assert SenderIgnoreList(_Cfg(), config_dir=tmp_path).snapshot() == set()
 
     def test_empty_mode_falls_back_to_blacklist(self, tmp_path):
         # data.get("mode", default) 只在键缺失时兜底；空串会让同步静默失效
-        _write_external(tmp_path, {"mode": "", "disable_list": ["100000005"]})
+        _write_external(tmp_path, {"mode": "", "disable_list": ["1000000001"]})
         assert SenderIgnoreList(_Cfg(), config_dir=tmp_path).snapshot() == {
-            "100000005"
+            "1000000001"
         }
 
     def test_missing_mode_key_defaults_to_blacklist(self, tmp_path):
-        _write_external(tmp_path, {"disable_list": ["100000005"]})
+        _write_external(tmp_path, {"disable_list": ["1000000001"]})
         assert SenderIgnoreList(_Cfg(), config_dir=tmp_path).snapshot() == {
-            "100000005"
+            "1000000001"
         }
 
     def test_uppercase_mode_is_normalized(self, tmp_path):
-        _write_external(tmp_path, {"mode": "BLACKLIST", "disable_list": ["100000005"]})
+        _write_external(tmp_path, {"mode": "BLACKLIST", "disable_list": ["1000000001"]})
         assert SenderIgnoreList(_Cfg(), config_dir=tmp_path).snapshot() == {
-            "100000005"
+            "1000000001"
         }
 
     def test_user_only_skips_bare_numbers(self, tmp_path):
@@ -159,26 +159,26 @@ class TestExternalSync:
             {
                 "mode": "blacklist",
                 "disable_list": [
-                    "100000004",
-                    "qq:FriendMessage:100000000",
-                    "@茧墨（肥鱼版）(100000005)",
+                    "1000000003",
+                    "qq:FriendMessage:1000000006",
+                    "@茧墨（肥鱼版）(1000000001)",
                 ],
             },
         )
         assert SenderIgnoreList(_Cfg(user_only=True), config_dir=tmp_path).snapshot() == {
-            "100000000",
-            "100000005",
+            "1000000006",
+            "1000000001",
         }
 
     def test_compat_mode_keeps_bare_numbers(self, tmp_path):
         """默认兼容模式行为不变：纯数字照收。"""
         _write_external(
             tmp_path,
-            {"mode": "blacklist", "disable_list": ["100000004", "100000005"]},
+            {"mode": "blacklist", "disable_list": ["1000000003", "1000000001"]},
         )
         assert SenderIgnoreList(_Cfg(), config_dir=tmp_path).snapshot() == {
-            "100000004",
-            "100000005",
+            "1000000003",
+            "1000000001",
         }
 
     def test_missing_file(self, tmp_path):
@@ -187,11 +187,11 @@ class TestExternalSync:
     def test_utf8_bom_config_is_readable(self, tmp_path):
         # Windows 记事本保存的 JSON 带 BOM；用 utf-8 严格解码会整张名单失效
         (tmp_path / "astrbot_plugin_completely_disable_config.json").write_text(
-            json.dumps({"mode": "blacklist", "disable_list": ["100000005"]}),
+            json.dumps({"mode": "blacklist", "disable_list": ["1000000001"]}),
             encoding="utf-8-sig",
         )
         gate = SenderIgnoreList(_Cfg(), config_dir=tmp_path)
-        assert gate.snapshot() == {"100000005"}
+        assert gate.snapshot() == {"1000000001"}
 
     def test_broken_json(self, tmp_path):
         (tmp_path / "astrbot_plugin_completely_disable_config.json").write_text(
@@ -200,7 +200,7 @@ class TestExternalSync:
         assert SenderIgnoreList(_Cfg(), config_dir=tmp_path).snapshot() == set()
 
     def test_sync_disabled(self, tmp_path):
-        _write_external(tmp_path, {"mode": "blacklist", "disable_list": ["100000005"]})
+        _write_external(tmp_path, {"mode": "blacklist", "disable_list": ["1000000001"]})
         gate = SenderIgnoreList(_Cfg(sync=False), config_dir=tmp_path)
         assert gate.snapshot() == set()
 
@@ -220,14 +220,14 @@ class TestExternalSync:
 
 class TestMergedList:
     def test_own_and_external_merge(self, tmp_path):
-        _write_external(tmp_path, {"mode": "blacklist", "disable_list": ["100000005"]})
+        _write_external(tmp_path, {"mode": "blacklist", "disable_list": ["1000000001"]})
         gate = SenderIgnoreList(_Cfg(ids="888888, @某人(999999)"), config_dir=tmp_path)
-        assert gate.snapshot() == {"888888", "999999", "100000005"}
+        assert gate.snapshot() == {"888888", "999999", "1000000001"}
 
     def test_self_never_ignored(self, tmp_path):
-        _write_external(tmp_path, {"mode": "blacklist", "disable_list": ["100000005"]})
+        _write_external(tmp_path, {"mode": "blacklist", "disable_list": ["1000000001"]})
         gate = SenderIgnoreList(_Cfg(), config_dir=tmp_path)
-        assert gate.is_ignored("100000005", self_id="100000005") is False
+        assert gate.is_ignored("1000000001", self_id="1000000001") is False
 
     @pytest.mark.parametrize("sender", ["", None])
     def test_empty_sender(self, sender):
@@ -237,13 +237,13 @@ class TestMergedList:
     def test_own_list_change_is_immediate(self):
         """WebUI 改手写名单必须立即生效，不能等 10 秒复用窗口。"""
         gate = SenderIgnoreList(_Cfg(ids=""), config_dir=None)
-        assert gate.is_ignored("100000005") is False
+        assert gate.is_ignored("1000000001") is False
 
-        gate._config.ignore_sender_ids = "100000005"
-        assert gate.is_ignored("100000005") is True
+        gate._config.ignore_sender_ids = "1000000001"
+        assert gate.is_ignored("1000000001") is True
 
         gate._config.ignore_sender_ids = ""
-        assert gate.is_ignored("100000005") is False
+        assert gate.is_ignored("1000000001") is False
 
 
 class TestChangeCallback:
@@ -272,11 +272,11 @@ class TestPoolPurge:
         )
 
         window = SlidingWindow(config)
-        window.append("g1", make_msg(sender_id="100000005"))
+        window.append("g1", make_msg(sender_id="1000000001"))
         window.append("g1", make_msg(sender_id="u1"))
-        window.append("g2", make_msg(sender_id="100000005"))
+        window.append("g2", make_msg(sender_id="1000000001"))
 
-        removed = window.purge_senders(set(), {"100000005"})
+        removed = window.purge_senders(set(), {"1000000001"})
         assert removed == 2
         assert [m.sender_id for m in window.get_messages("g1")] == ["u1"]
         assert window.get_messages("g2") == []
@@ -287,10 +287,10 @@ class TestPoolPurge:
         )
 
         window = SlidingWindow(config)
-        window.append("g1", make_msg(sender_id="100000005"))
-        window.append("g2", make_msg(sender_id="100000005"))
+        window.append("g1", make_msg(sender_id="1000000001"))
+        window.append("g2", make_msg(sender_id="1000000001"))
 
-        assert window.purge_senders({"g1"}, {"100000005"}) == 1
+        assert window.purge_senders({"g1"}, {"1000000001"}) == 1
         assert window.get_messages("g1") == []
         assert len(window.get_messages("g2")) == 1
 
@@ -312,10 +312,10 @@ class TestPoolPurge:
 
         window = SlidingWindow(config)
         window.append("g1", make_msg(sender_id="bot-1"))
-        window.append("g1", make_msg(sender_id="100000005"))
+        window.append("g1", make_msg(sender_id="1000000001"))
 
         removed = window.purge_senders(
-            set(), {"bot-1", "100000005"}, protected_ids={"bot-1"}
+            set(), {"bot-1", "1000000001"}, protected_ids={"bot-1"}
         )
         assert removed == 1
         assert [m.sender_id for m in window.get_messages("g1")] == ["bot-1"]

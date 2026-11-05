@@ -153,6 +153,84 @@ async def handle_user_message(
     # 调用，统一移到后台，不再阻塞消息进入主 LLM 的关键路径。
     _schedule_image_pipeline(event, component_manager)
 
+    # 跨消息图片承接：必须**同步**登记，不能等后台流水线完成。
+    # 平台会把「图片」和紧随其后的「文字」拆成两条消息，若等到后台
+    # 入队完成再记录，文字消息的请求往往已经发出（实测 0.5 秒间隔）。
+    _record_recent_images(event)
+
+
+def _record_recent_images(event: "AstrMessageEvent") -> None:
+    """把本条消息里的图片同步登记到跨消息承接表。
+
+    与 ``_schedule_image_pipeline`` 的区别：那条路走后台（下载 → pHash →
+    入队 → 解析），本函数**不做任何 IO**，只把 adapter 已经解析出的图片引用
+    立即记下，保证紧随其后的文字消息能取到。
+
+    取引用时优先本地文件路径（AstrBot 的 ``prepare_model_image`` 可直接读），
+    回退 http URL（由 AstrBot 自行下载）。两者都缺则跳过该图。
+
+    全过程故障隔离：登记失败绝不影响消息主流程。
+    """
+    try:
+        from ..config import get_config
+
+        config = get_config()
+        if not config.get("image_carryover_enable"):
+            return
+
+        from ..platform import get_adapter
+
+        adapter = get_adapter(event)
+        images = adapter.get_images(event)
+        if not images:
+            return
+
+        session_id = adapter.get_session_id(event)
+        user_id = adapter.get_user_id(event)
+        if not session_id or not user_id:
+            return
+
+        raw_msg = adapter.get_raw_message(event) or {}
+        message_id = str(raw_msg.get("message_id") or "")
+
+        from ..image import get_recent_image_registry
+
+        registry = get_recent_image_registry(
+            max_per_session=int(
+                config.get("image_carryover_max_per_session", 5) or 5
+            )
+        )
+        recorded = 0
+        for info in images:
+            ref = ""
+            file_path = getattr(info, "file_path", None)
+            if file_path:
+                ref = str(file_path)
+            else:
+                url = getattr(info, "url", None)
+                if url:
+                    ref = str(url)
+            if not ref:
+                continue
+            if registry.record(
+                session_id=session_id,
+                user_id=user_id,
+                ref=ref,
+                message_id=message_id,
+            ):
+                recorded += 1
+
+        if recorded:
+            logger.debug(
+                "已登记 %d 张待承接图片 session=%s user=%s msg=%s",
+                recorded,
+                session_id,
+                user_id,
+                message_id,
+            )
+    except Exception as e:
+        logger.debug(f"登记近期图片失败（不影响主流程）：{e}")
+
 
 def _schedule_image_pipeline(
     event: "AstrMessageEvent", component_manager: "ComponentManager"
@@ -365,14 +443,29 @@ async def _add_to_l1_buffer(
     """
     from ..platform import get_adapter
 
+    adapter = get_adapter(event)
+
     content = event.message_str
-    if not content:
-        logger.debug("消息内容为空，跳过添加")
+
+    # 纯图片消息（含表情包）没有文字，message_str 为空。
+    # 若在这里直接 return，这条消息就完全不进 L1：
+    #   - 后续图片解析完成后没有容器承接描述（prepend 只能挂到别人的消息上）
+    #   - 用户紧接着问「图片内容是什么」时，上下文里连「有图」这件事都没有
+    # 因此改为：有图片时照样入队，内容先用占位符占位，解析完成后再替换。
+    has_images = False
+    try:
+        has_images = bool(adapter.get_images(event))
+    except Exception as e:
+        logger.debug(f"检测消息图片失败（按无图处理）：{e}")
+
+    if not content and not has_images:
+        logger.debug("消息内容为空且无图片，跳过添加")
         return
 
     from ..utils import sanitize_input
 
-    content = sanitize_input(content, source="user_message")
+    if content:
+        content = sanitize_input(content, source="user_message")
 
     buffer = component_manager.get_available_component("l1_buffer")
     if not buffer:
@@ -381,7 +474,6 @@ async def _add_to_l1_buffer(
 
     l1_buffer = cast("L1Buffer", buffer)
 
-    adapter = get_adapter(event)
     group_id = adapter.get_group_id(event)
     # L1 队列键使用会话 ID：私聊为 private:{user_id}，避免不同私聊用户
     # 共用空字符串队列导致上下文互相污染；画像等仍使用原始群 ID
@@ -430,10 +522,16 @@ async def _add_to_l1_buffer(
                         f"从平台 API 回填回复信息：message_id={reply_info.message_id}"
                     )
 
+    # 纯图片消息 content 为空：用占位文本入队，保证这条消息在 L1 里有位置，
+    # 后续 _queue_images_to_l1_buffer 才能把 [图:描述] 拼到它身上，
+    # 而不是失败后退化成「孤立图片消息」。
+    # 占位符对模型无意义，所以用可读的中文说明了来源。
+    add_content = content or ("[图片]" if has_images else "")
+
     await l1_buffer.add_message(
         group_id=session_id,
         role="user",
-        content=content,
+        content=add_content,
         source=user_id,
         metadata=metadata,
         persona_id=persona_id,
@@ -732,8 +830,11 @@ async def _queue_images_to_l1_buffer(
 
     if image_suffixes:
         prefix = "".join(image_suffixes)
+        # 优先按 message_id 精确定位图片自己那条消息：图片流水线是后台跑的，
+        # 完成时 L1 末尾往往已经是别人的发言，只按 same_source 会失败并退化成
+        # 一条孤立的 [图:...] 消息，语义上和原句脱节。
         prepended = l1_buffer.prepend_to_last_message(
-            session_id, prefix, same_source=user_id
+            session_id, prefix, same_source=user_id, message_id=message_id
         )
         if not prepended:
             user_name = adapter.get_user_name(event)
@@ -889,7 +990,7 @@ async def _parse_images_if_enabled(
             session_id, img_item.image_hash, ImageParseStatus.FAILED, claim_token
         )
         placeholder = f"[IMG:{img_item.image_hash.removeprefix('ph:')[:12]}]"
-        l1_buffer.replace_image_placeholder(session_id, placeholder, "")
+        l1_buffer.replace_image_placeholder(session_id, placeholder, "[图:无法识别]")
 
     if not parse_pairs:
         # 全部无 url，退还预扣配额
@@ -913,7 +1014,7 @@ async def _parse_images_if_enabled(
                 session_id, img_item.image_hash, ImageParseStatus.FAILED, claim_token
             )
             placeholder = f"[IMG:{img_item.image_hash.removeprefix('ph:')[:12]}]"
-            l1_buffer.replace_image_placeholder(session_id, placeholder, "")
+            l1_buffer.replace_image_placeholder(session_id, placeholder, "[图:无法识别]")
         return
 
     success_count = 0
@@ -924,7 +1025,7 @@ async def _parse_images_if_enabled(
                 session_id, img_item.image_hash, ImageParseStatus.FAILED, claim_token
             )
             placeholder = f"[IMG:{img_item.image_hash.removeprefix('ph:')[:12]}]"
-            l1_buffer.replace_image_placeholder(session_id, placeholder, "")
+            l1_buffer.replace_image_placeholder(session_id, placeholder, "[图:无法识别]")
             continue
 
         if not result.content:
@@ -933,7 +1034,7 @@ async def _parse_images_if_enabled(
                 session_id, img_item.image_hash, ImageParseStatus.FAILED, claim_token
             )
             placeholder = f"[IMG:{img_item.image_hash.removeprefix('ph:')[:12]}]"
-            l1_buffer.replace_image_placeholder(session_id, placeholder, "")
+            l1_buffer.replace_image_placeholder(session_id, placeholder, "[图:无法识别]")
             continue
 
         if cache_manager and cache_manager.is_available:

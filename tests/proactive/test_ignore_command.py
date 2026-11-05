@@ -37,13 +37,13 @@ def test_split_id_list():
 
 @pytest.mark.asyncio
 async def test_list_shows_effective_and_manual():
-    plugin = _plugin(current="888888", effective={"888888", "100000005"})
+    plugin = _plugin(current="888888", effective={"888888", "1000000001"})
     event = _event()
 
     await plugin.cmd_ignore(event, "list")
 
     text = event.set_result.call_args[0][0]
-    assert "100000005" in text and "888888" in text and "2 个" in text
+    assert "1000000001" in text and "888888" in text and "2 个" in text
 
 
 @pytest.mark.asyncio
@@ -51,10 +51,10 @@ async def test_add_writes_hidden_config():
     plugin = _plugin(current="888888")
     event = _event()
 
-    await plugin.cmd_ignore(event, "add", "100000005")
+    await plugin.cmd_ignore(event, "add", "1000000001")
 
     plugin.config.set_hidden.assert_called_once_with(
-        "reply_ignore_sender_ids", "888888,100000005"
+        "reply_ignore_sender_ids", "888888,1000000001"
     )
     plugin._sender_gate.refresh.assert_called_once_with(force=True)
 
@@ -62,10 +62,10 @@ async def test_add_writes_hidden_config():
 @pytest.mark.asyncio
 async def test_add_rejects_duplicate_across_formats():
     # 手写名单里是带昵称写法，但同一个人不应被重复加入
-    plugin = _plugin(current="@茧墨（肥鱼版）(100000005)")
+    plugin = _plugin(current="@茧墨（肥鱼版）(1000000001)")
     event = _event()
 
-    await plugin.cmd_ignore(event, "add", "100000005")
+    await plugin.cmd_ignore(event, "add", "1000000001")
 
     plugin.config.set_hidden.assert_not_called()
     assert "已在忽略名单" in event.set_result.call_args[0][0]
@@ -73,10 +73,10 @@ async def test_add_rejects_duplicate_across_formats():
 
 @pytest.mark.asyncio
 async def test_remove_matches_normalized_form():
-    plugin = _plugin(current="@茧墨（肥鱼版）(100000005),888888")
+    plugin = _plugin(current="@茧墨（肥鱼版）(1000000001),888888")
     event = _event()
 
-    await plugin.cmd_ignore(event, "remove", "100000005")
+    await plugin.cmd_ignore(event, "remove", "1000000001")
 
     plugin.config.set_hidden.assert_called_once_with(
         "reply_ignore_sender_ids", "888888"
@@ -88,7 +88,7 @@ async def test_remove_missing_is_reported():
     plugin = _plugin(current="888888")
     event = _event()
 
-    await plugin.cmd_ignore(event, "remove", "100000005")
+    await plugin.cmd_ignore(event, "remove", "1000000001")
 
     plugin.config.set_hidden.assert_not_called()
     assert "不在手写忽略名单" in event.set_result.call_args[0][0]
@@ -99,25 +99,25 @@ async def test_remove_multi_id_entry_keeps_siblings():
     """一个条目里含多个 ID 时，只移除目标 ID，不能整条删掉。
 
     ``next(iter(extract_ids(...)))`` 的取值依赖 set 的哈希顺序，
-    曾导致 "100000000/100000005" 整条被删、无辜 ID 一起消失。
+    曾导致 "1000000006/1000000001" 整条被删、无辜 ID 一起消失。
     """
-    plugin = _plugin(current="100000000/100000005")
+    plugin = _plugin(current="1000000006/1000000001")
     event = _event()
 
-    await plugin.cmd_ignore(event, "remove", "100000005")
+    await plugin.cmd_ignore(event, "remove", "1000000001")
 
     plugin.config.set_hidden.assert_called_once()
     saved = plugin.config.set_hidden.call_args[0][1]
-    assert "100000000" in saved, "同条目里的其他 ID 必须保留"
-    assert "100000005" not in saved
+    assert "1000000006" in saved, "同条目里的其他 ID 必须保留"
+    assert "1000000001" not in saved
 
 
 @pytest.mark.asyncio
 async def test_add_detects_id_inside_multi_entry():
-    plugin = _plugin(current="100000000/100000005")
+    plugin = _plugin(current="1000000006/1000000001")
     event = _event()
 
-    await plugin.cmd_ignore(event, "add", "100000005")
+    await plugin.cmd_ignore(event, "add", "1000000001")
 
     plugin.config.set_hidden.assert_not_called()
     assert "已在忽略名单" in event.set_result.call_args[0][0]
@@ -128,7 +128,7 @@ async def test_multiple_ids_in_one_command_rejected():
     plugin = _plugin()
     event = _event()
 
-    await plugin.cmd_ignore(event, "add", "100000005/100000000")
+    await plugin.cmd_ignore(event, "add", "1000000001/1000000002")
 
     plugin.config.set_hidden.assert_not_called()
     assert "一次只提供一个" in event.set_result.call_args[0][0]
@@ -172,13 +172,13 @@ async def test_alpha_id_reports_platform_limitation():
 
 @pytest.mark.asyncio
 async def test_sync_forces_refresh():
-    plugin = _plugin(effective={"100000005"})
+    plugin = _plugin(effective={"1000000001"})
     event = _event()
 
     await plugin.cmd_ignore(event, "sync")
 
     plugin._sender_gate.refresh.assert_called_once_with(force=True)
-    assert "100000005" in event.set_result.call_args[0][0]
+    assert "1000000001" in event.set_result.call_args[0][0]
 
 
 @pytest.mark.asyncio
