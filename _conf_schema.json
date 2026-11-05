@@ -29,9 +29,9 @@
         "items": {
           "enable": {
             "type": "bool",
-            "default": false,
+            "default": true,
             "description": "启用图片解析",
-            "hint": "视觉解析会产生额外 LLM 调用，默认关闭；完成限流配置后再显式启用"
+            "hint": "视觉解析会产生额外 LLM 调用；本版默认开启，可用 all 模式让图片描述常驻上下文"
           },
           "provider": {
             "type": "string",
@@ -42,9 +42,9 @@
           },
           "mode": {
             "type": "string",
-            "default": "related",
+            "default": "all",
             "description": "解析模式",
-            "hint": "全：所有图片；相关：触发LLM/被引用/OCR命中的图片",
+            "hint": "全：所有图片都解析；相关：仅触发 LLM/被引用/OCR 命中的图片",
             "options": [
               "all",
               "related"
@@ -52,9 +52,9 @@
           },
           "daily_quota": {
             "type": "int",
-            "default": 200,
+            "default": 500,
             "description": "每日解析限额",
-            "hint": "全局共享计数器，超限后静默跳过，每日00:00重置"
+            "hint": "全局共享计数器，超限后静默跳过，每日 00:00 重置；按群活跃度调整"
           }
         }
       }
