@@ -1676,15 +1676,51 @@ class L1Buffer(Component):
         return replaced
 
     def add_image(self, group_id: str, image_item: Any) -> None:
+        """把图片加入待解析队列。
+
+        同一 hash 已存在时不再追加：同一张图在短时间内可能被重复入队
+        （重复消息、图片与文字分两条推送等），重复项会导致
+        配额被重复消耗，且 mark_image_parsed 的 claim 校验容易出现
+        「部分记录永远停在 PROCESSING」的死图问题。
+        """
         queue_key = self._get_queue_key(group_id)
 
         if queue_key not in self._image_queues:
             self._image_queues[queue_key] = []
 
-        self._image_queues[queue_key].append(image_item)
+        pending = self._image_queues[queue_key]
+        new_hash = getattr(image_item, "image_hash", "")
+
+        existing = next(
+            (img for img in pending if getattr(img, "image_hash", "") == new_hash),
+            None,
+        )
+        if existing is not None:
+            # 已存在：若旧记录已终结而新图带更多信息（如补上了 url），
+            # 就把 url/file_path 补进旧记录，避免丢掉可用信息。
+            try:
+                new_info = getattr(image_item, "image_info", None)
+                old_info = getattr(existing, "image_info", None)
+                if new_info is not None and old_info is not None:
+                    if getattr(new_info, "url", "") and not getattr(old_info, "url", ""):
+                        old_info.url = new_info.url
+                    if (
+                        getattr(new_info, "file_path", "")
+                        and not getattr(old_info, "file_path", "")
+                    ):
+                        old_info.file_path = new_info.file_path
+            except Exception:
+                pass
+            logger.debug(
+                f"图片重复入队已合并：{queue_key}, hash={new_hash[:8]}..., "
+                f"队列大小={len(pending)}"
+            )
+            return
+
+        pending.append(image_item)
         logger.debug(
-            f"图片已入队：{queue_key}, hash={image_item.image_hash[:8]}..., "
-            f"队列大小={len(self._image_queues[queue_key])}"
+            f"图片已入队：{queue_key}, hash={new_hash[:8]}..., "
+            f"队列大小={len(pending)}"
         )
 
     def get_images(
@@ -1871,6 +1907,21 @@ class L1Buffer(Component):
         status: Any,
         claim_token: str = "",
     ) -> bool:
+        """回写图片解析结果。
+
+        claim 校验的边界（曾经导致死图循环）：
+
+        旧实现发现 token 不匹配就直接 return，**状态完全不动**。而
+        ``claim_pending_images`` 会把超时的 PROCESSING 项回收成 PENDING
+        再重新发放新 token；于是「解析失败 -> 回写被拒 -> 状态仍是
+        PROCESSING -> 超时被回收 -> 再次 claim -> 再失败」无限循环。
+        实测同一张 404 图（hash=ae4cbe16）会在队列里卡住数天，
+        每来一条新消息都被重新解析一次，并让等待机制多等满超时。
+
+        现在的取舍：token 不匹配时仍写入**终态**（SUCCESS/FAILED），
+        因为失败是客观事实，覆盖它的风险远小于死循环；仅当对方要写的
+        也是 PROCESSING（即另一路正在解析中）时才拒绝，避免抢状态。
+        """
         from ..image import ImageParseStatus
 
         queue_key = self._get_queue_key(group_id)
@@ -1878,26 +1929,44 @@ class L1Buffer(Component):
         if queue_key not in self._image_queues:
             return False
 
-        for img in self._image_queues[queue_key]:
-            if img.image_hash == image_hash:
-                if claim_token and img.claim_token != claim_token:
-                    logger.warning(
-                        f"忽略非持有者图片回写：{queue_key}, hash={image_hash[:8]}"
-                    )
-                    return False
-                img.status = status
-                if status != ImageParseStatus.PROCESSING:
-                    img.claim_token = ""
-                    img.claimed_at = None
-                logger.debug(
-                    f"图片状态已更新：{queue_key}, hash={image_hash[:8]}..., "
-                    f"status={status.value}"
-                )
-                # 唤醒正在等待这张图完成的 LLM 请求
-                self._notify_image_state_changed(queue_key)
-                return True
+        # 同一 hash 可能有多条记录（同一张图在短时间内被重复入队）。
+        # 旧实现命中第一条就 return，其余记录永远停在 PROCESSING，
+        # 这是死图循环的第二个成因。改为收集全部匹配项统一回写。
+        matched = [
+            img for img in self._image_queues[queue_key]
+            if img.image_hash == image_hash
+        ]
+        if not matched:
+            return False
 
-        return False
+        token_mismatch = bool(claim_token) and all(
+            img.claim_token != claim_token for img in matched
+        )
+        if token_mismatch and status == ImageParseStatus.PROCESSING:
+            logger.debug(
+                f"忽略非持有者 PROCESSING 回写：{queue_key}, hash={image_hash[:8]}"
+            )
+            return False
+        if token_mismatch:
+            logger.warning(
+                f"非持有者回写终态，仍接受以解除卡死：{queue_key}, "
+                f"hash={image_hash[:8]}, status={status.value}, "
+                f"records={len(matched)}"
+            )
+
+        for img in matched:
+            img.status = status
+            if status != ImageParseStatus.PROCESSING:
+                img.claim_token = ""
+                img.claimed_at = None
+
+        logger.debug(
+            f"图片状态已更新：{queue_key}, hash={image_hash[:8]}..., "
+            f"status={status.value}, records={len(matched)}"
+        )
+        # 唤醒正在等待这张图完成的 LLM 请求
+        self._notify_image_state_changed(queue_key)
+        return True
 
     def release_image_claim(
         self,
