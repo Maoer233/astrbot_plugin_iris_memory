@@ -906,14 +906,14 @@ class IrisMemoryPlugin(Star):
                 )
             else:
                 event.set_result(
-                    "请提供有效的用户 ID，例如：/iris_reply ignore add 100000005"
+                    "请提供有效的用户 ID，例如：/iris_reply ignore add 1000000001"
                 )
             return
         if len(ids) > 1:
             # 一条命令写多个 ID 时无法判断「加哪一个」，静默取第一个会让
             # 用户以为全加了；更糟的是 remove 会连带删掉其他 ID。
             event.set_result(
-                "请一次只提供一个用户 ID，例如：/iris_reply ignore add 100000005"
+                "请一次只提供一个用户 ID，例如：/iris_reply ignore add 1000000001"
             )
             return
         target = next(iter(ids))
@@ -1714,15 +1714,39 @@ class IrisMemoryPlugin(Star):
             if self.component_manager:
                 await handle_agent_done(event, resp, self.context, self.component_manager)
 
+    # 主动插话类动机：这些场景下用户**没有请求** bot 说话，
+    # bot 是自行判断"现在插一句合适"才开口。因此当这一轮失败时，
+    # 不应在群里留下任何痕迹——冒一句「模型没有返回内容」等于用
+    # 自己的失败去打扰一群没找它的人，且文案把技术故障说成
+    # "内容被拦"，会误导群友改话题。
+    _SILENT_FAILURE_MODES = frozenset({"chime_in", "follow_up", "initiate"})
+
     @filter.on_decorating_result()
     async def on_decorating_result(self, event: AstrMessageEvent) -> None:
-        """消息发送前处理：错误友好化 + Markdown 去除"""
+        """消息发送前处理：错误友好化 + Markdown 去除
+
+        主动回复（chime_in / follow_up / initiate）失败时整条消息丢弃，
+        只有被动应答（用户 @ 或点名）才会给出可见的失败提示。
+        """
         result = event.get_result()
         if not result:
             return
 
         if self._error_processor and self._error_processor.should_process(event):
-            self._error_processor.process_result(result)
+            friendly = self._error_processor.detect_and_build(result)
+            if friendly is not None:
+                mode = event.get_extra("iris_mode") or ""
+                if mode in self._SILENT_FAILURE_MODES:
+                    # 主动插话失败：静默丢弃，不占群里的消息位
+                    logger.info(
+                        f"Iris Reply: 主动回复（{mode}）失败，已静默丢弃：{friendly.reason}"
+                    )
+                    try:
+                        result.chain.clear()
+                    except Exception:
+                        pass
+                    return
+                self._error_processor.process_result(result)
 
         if self._markdown_stripper and self._markdown_stripper.should_process(event):
             self._markdown_stripper.process_result(result)
