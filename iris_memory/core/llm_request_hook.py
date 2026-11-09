@@ -931,8 +931,9 @@ async def _collect_l1_context(
         if msg.metadata:
             mid = msg.metadata.get("message_id")
             if mid:
+                # 与正文渲染保持同一套标签：assistant 显示为「我」。
                 uname = (
-                    msg.metadata.get("user_name", "") if msg.role == "user" else "Bot"
+                    msg.metadata.get("user_name", "") if msg.role == "user" else "我"
                 )
                 uid = msg.source if msg.role == "user" and msg.source else ""
                 msg_id_map[str(mid)] = (msg.content, uname, uid)
@@ -992,7 +993,10 @@ async def _collect_l1_context(
 
             lines.append(f"{sender}:{reply_tag} {content}")
         elif role == "assistant":
-            lines.append(f"Bot: {content}")
+            # 必须用「我」而不是「Bot」：滑动窗口侧（main.py / proactive.py）
+            # 把自己的发言记为 sender_name="我"，两处标签不一致时，模型会把
+            # 同一句话当成两个人的发言，导致接话时绕开自己刚说的内容、凭空另起一句。
+            lines.append(f"我: {content}")
 
     lines.append("→ 较近（紧邻当前消息）")
 

@@ -529,7 +529,10 @@ class TestPreprocessLLMRequest:
         assert "<iris:l1_context>" in text
         assert "张三(user1):" in text
         assert "你好" in text
-        assert "Bot: 你好！" in text
+        # assistant 渲染为「我」，与滑动窗口侧 sender_name="我" 保持一致；
+        # 用 "Bot" 会让模型把同一句发言当成两个人说的。
+        assert "我: 你好！" in text
+        assert "Bot:" not in text
 
     @pytest.mark.asyncio
     async def test_preprocess_without_user_name(self):
@@ -594,7 +597,8 @@ class TestPreprocessLLMRequest:
 
         text = _get_extra_parts_text(req)
         assert "<iris:l1_context>" in text
-        assert "Bot: 你好！" in text
+        assert "我: 你好！" in text
+        assert "Bot:" not in text
 
     @pytest.mark.asyncio
     async def test_preprocess_with_reply_info(self):

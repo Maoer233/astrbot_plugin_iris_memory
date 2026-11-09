@@ -27,8 +27,10 @@ async def handle_initiate_backfill(
 
     复用 handle_llm_response 的写入路径与格式：
     role="assistant"、source="assistant"、内容原文写入，不加任何前缀
-    （渲染层统一显示为 "Bot: {content}"，见
+    （渲染层统一显示为 "我: {content}"，见
     llm_request_hook._collect_l1_context 对 assistant 消息的处理）。
+    标签必须与滑动窗口侧的 sender_name="我" 保持一致，
+    否则模型会把同一句发言当成两个人说的。
 
     会话键约定：群聊的 L1 队列键即群号
     （见 PlatformAdapter.get_session_id；私聊才使用 private:{user_id}，
