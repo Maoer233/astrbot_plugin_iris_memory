@@ -935,6 +935,10 @@ class LLMManager(Component):
     def _get_default_provider(self) -> Optional[str]:
         """获取 AstrBot 默认 Provider ID
 
+        AstrBot 4.24+ 把「默认模型」从 ``provider_settings.default_provider_id``
+        迁移到了 ``agent_runner.config.model.provider_id``，并把旧键 pop 掉
+        （见 astrbot/core/utils/migra_helper.py）。此处先读新位置，再兼容旧键。
+
         Returns:
             默认 Provider ID，无法获取时返回 None
         """
@@ -942,6 +946,16 @@ class LLMManager(Component):
             if hasattr(self._context, "get_config"):
                 config = self._context.get_config()
                 if config:
+                    # 新版位置：agent_runner.config.model.provider_id
+                    try:
+                        new_provider_id = config["agent_runner"]["config"]["model"][
+                            "provider_id"
+                        ]
+                    except (KeyError, TypeError):
+                        new_provider_id = None
+                    if new_provider_id:
+                        return new_provider_id
+
                     provider_settings = config.get("provider_settings", {})
                     default_provider_id = provider_settings.get("default_provider_id")
                     if default_provider_id:
